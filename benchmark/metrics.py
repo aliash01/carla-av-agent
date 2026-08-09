@@ -1,13 +1,15 @@
 import carla
 
 class MetricsRecorder:
-    def __init__(self, world, vehicle):
+    def __init__(self, world, vehicle, route):
         self.collisions = 0
         self.lane_invasions = 0
         self.solid_invasions = 0
         self.max_speed = 0
         self.speed_sum = 0
         self.speed_ticks = 0
+        self.route = route
+        self.route_index = 0
 
         bp_lib = world.get_blueprint_library()
         collision_detector_bp = bp_lib.find('sensor.other.collision')
@@ -18,7 +20,6 @@ class MetricsRecorder:
 
         self.collision_detector.listen(self._on_collision)
         self.lane_invasion_detector.listen(self._on_lane_invasion)
-
 
     def _on_collision(self, event):
         self.collisions += 1
@@ -38,12 +39,18 @@ class MetricsRecorder:
         self.speed_sum += current_speed 
         self.speed_ticks += 1
 
+        loc = vehicle.get_location()
+        for i in range(self.route_index + 1, min(self.route_index + 10, len(self.route))):
+            if self.route[i][0].transform.location.distance(loc) < 5.0:
+                self.route_index = i
+
     def finalize(self) -> dict:
         return {"collisions": self.collisions,
                 "lane_invasions": self.lane_invasions,
                 "solid_invasions": self.solid_invasions,
                 "max_speed_kmh": round(self.max_speed, 1),
-                "avg_speed_kmh": round(self.speed_sum / self.speed_ticks, 1) if self.speed_ticks else 0.0}
+                "avg_speed_kmh": round(self.speed_sum / self.speed_ticks, 1) if self.speed_ticks else 0.0,
+                "completion_pct": round(100 * self.route_index / (len(self.route) - 1), 1)}
 
     def stop(self):
         for sensor in (self.collision_detector, self.lane_invasion_detector):

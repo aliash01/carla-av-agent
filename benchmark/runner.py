@@ -1,9 +1,10 @@
-import sys
+import sys, os, csv
 sys.path.insert(0, r'C:\CarlaUE5\PythonAPI\carla')
 
 from typing import Callable
 import carla
 from benchmark.metrics import MetricsRecorder
+from agents.navigation.global_route_planner import GlobalRoutePlanner
 
 FIXED_DELTA_S = 0.05
 
@@ -46,7 +47,9 @@ def run_route(client: carla.Client,
         vehicle_bp = bp_lib.filter('sprinter')[0] # fixed vehicle for comparable results across agents
         vehicle = world.spawn_actor(vehicle_bp, start) # spawns vehicle actor at start point
 
-        recorder = MetricsRecorder(world, vehicle) # create recorder for measuring metrics
+        grp = GlobalRoutePlanner(world.get_map(), 2.0)      
+        route = grp.trace_route(start.location, end.location)
+        recorder = MetricsRecorder(world, vehicle, route)
 
         # set synchronous mode on for benchmark
         settings = world.get_settings() 
@@ -91,9 +94,24 @@ def run_route(client: carla.Client,
             "error": error,
             **metrics}
 
+def run_batch(client, world, agent_factory, out_name: str) -> list:
+    """Run all ROUTES with the given agent, write results/<out_name>.csv."""
+    results = []
+    for route_def in ROUTES:
+        result = run_route(client, world, agent_factory, route_def)
+        print(result)
+        results.append(result)
+
+    os.makedirs('results', exist_ok=True)
+    out_path = os.path.join('results', f'{out_name}.csv')
+    with open(out_path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=results[0].keys())
+        writer.writeheader()
+        writer.writerows(results)
+    print(f'wrote {out_path}')
+    return results
 
 if __name__ == '__main__':
-    from benchmark.routes import ROUTES
     from agents.navigation.behavior_agent import BehaviorAgent
 
     def behavior_agent_factory(vehicle, destination):
@@ -105,5 +123,4 @@ if __name__ == '__main__':
     client.set_timeout(30.0)
     world = client.get_world()
 
-    for route_def in ROUTES:
-        print(run_route(client, world, behavior_agent_factory, route_def))
+    run_batch(client, world, behavior_agent_factory, 'baseline_behavioragent')
