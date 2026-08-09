@@ -3,6 +3,7 @@ sys.path.insert(0, r'C:\CarlaUE5\PythonAPI\carla')
 
 from typing import Callable
 import carla
+from benchmark.metrics import MetricsRecorder
 
 FIXED_DELTA_S = 0.05
 
@@ -38,11 +39,14 @@ def run_route(client: carla.Client,
     ticks = 0
     timed_out = False
     error = None
+    recorder = None
 
     try:
         bp_lib = world.get_blueprint_library() 
         vehicle_bp = bp_lib.filter('sprinter')[0] # fixed vehicle for comparable results across agents
         vehicle = world.spawn_actor(vehicle_bp, start) # spawns vehicle actor at start point
+
+        recorder = MetricsRecorder(world, vehicle) # create recorder for measuring metrics
 
         # set synchronous mode on for benchmark
         settings = world.get_settings() 
@@ -65,6 +69,8 @@ def run_route(client: carla.Client,
         error = str(e) # agent failure is a benchmark result, not a batch-stopper
 
     finally:
+        if recorder is not None: 
+            recorder.stop()
         if vehicle is not None and vehicle.is_alive:
             vehicle.destroy()
 
@@ -79,6 +85,8 @@ def run_route(client: carla.Client,
             "done": agent.done() if agent is not None and error is None else False,
             "timeout": timed_out,
             "sim_time_s": ticks * FIXED_DELTA_S,
+            "collisions": recorder.collisions if recorder is not None else None,
+            "lane_invasions": recorder.lane_invasions if recorder is not None else None,
             "error": error}
 
 
