@@ -4,6 +4,7 @@ sys.path.insert(0, r'C:\CarlaUE5\PythonAPI\carla')
 from typing import Callable
 import carla
 from benchmark.metrics import MetricsRecorder
+from benchmark.routes import ROUTES
 from agents.navigation.global_route_planner import GlobalRoutePlanner
 
 FIXED_DELTA_S = 0.05
@@ -13,6 +14,7 @@ def run_route(client: carla.Client,
               world: carla.World,
               agent_factory: Callable,
               route_def: dict,
+              grp: GlobalRoutePlanner,
               timeout_s: float = 300.0) -> dict:
     """
     Run a single benchmark route in synchronous mode.
@@ -46,11 +48,9 @@ def run_route(client: carla.Client,
         bp_lib = world.get_blueprint_library() 
         vehicle_bp = bp_lib.filter('sprinter')[0] # fixed vehicle for comparable results across agents
         vehicle = world.spawn_actor(vehicle_bp, start) # spawns vehicle actor at start point
-
-        grp = GlobalRoutePlanner(world.get_map(), 2.0)      
+        # judge's own copy of the route, for completion % (the agent traces its own)
         route = grp.trace_route(start.location, end.location)
         recorder = MetricsRecorder(world, vehicle, route)
-
         # set synchronous mode on for benchmark
         settings = world.get_settings() 
         settings.synchronous_mode = True 
@@ -97,8 +97,9 @@ def run_route(client: carla.Client,
 def run_batch(client, world, agent_factory, out_name: str) -> list:
     """Run all ROUTES with the given agent, write results/<out_name>.csv."""
     results = []
+    grp = GlobalRoutePlanner(world.get_map(), 2.0)
     for route_def in ROUTES:
-        result = run_route(client, world, agent_factory, route_def)
+        result = run_route(client, world, agent_factory, route_def, grp)
         print(result)
         results.append(result)
 
