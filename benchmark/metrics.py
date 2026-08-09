@@ -5,6 +5,9 @@ class MetricsRecorder:
         self.collisions = 0
         self.lane_invasions = 0
         self.solid_invasions = 0
+        self.max_speed = 0
+        self.speed_sum = 0
+        self.speed_ticks = 0
 
         bp_lib = world.get_blueprint_library()
         collision_detector_bp = bp_lib.find('sensor.other.collision')
@@ -25,6 +28,22 @@ class MetricsRecorder:
         if any('Solid' in str(m.type) for m in event.crossed_lane_markings):
             self.solid_invasions += 1
 
+    def on_tick(self, vehicle):
+        current_speed = 3.6 * vehicle.get_velocity().length() # 3.6 to convert from m/s to km/h
+
+        if current_speed > self.max_speed:
+            self.max_speed = current_speed
+
+        # keep count of total speed and tick to calculate average
+        self.speed_sum += current_speed 
+        self.speed_ticks += 1
+
+    def finalize(self) -> dict:
+        return {"collisions": self.collisions,
+                "lane_invasions": self.lane_invasions,
+                "solid_invasions": self.solid_invasions,
+                "max_speed_kmh": round(self.max_speed, 1),
+                "avg_speed_kmh": round(self.speed_sum / self.speed_ticks, 1) if self.speed_ticks else 0.0}
 
     def stop(self):
         for sensor in (self.collision_detector, self.lane_invasion_detector):

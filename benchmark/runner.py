@@ -59,6 +59,7 @@ def run_route(client: carla.Client,
 
         while not agent.done():
             world.tick()
+            recorder.on_tick(vehicle)
             vehicle.apply_control(agent.run_step())
             ticks += 1
             if ticks * FIXED_DELTA_S > timeout_s:
@@ -81,13 +82,14 @@ def run_route(client: carla.Client,
         world.apply_settings(settings)
         trafficManager.set_synchronous_mode(False)
 
+    metrics = recorder.finalize() if recorder is not None else {}
+
     return {"route_id": route_def["id"],
             "done": agent.done() if agent is not None and error is None else False,
             "timeout": timed_out,
             "sim_time_s": ticks * FIXED_DELTA_S,
-            "collisions": recorder.collisions if recorder is not None else None,
-            "lane_invasions": recorder.lane_invasions if recorder is not None else None,
-            "error": error}
+            "error": error,
+            **metrics}
 
 
 if __name__ == '__main__':
