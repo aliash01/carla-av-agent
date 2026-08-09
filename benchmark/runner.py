@@ -131,3 +131,4 @@ if __name__ == '__main__':
 
     grp = GlobalRoutePlanner(world.get_map(), 2.0)
     print(run_batch(client, world, v1_factory, 'v1_agent'))
+    #print(run_route(client, world, v1_factory, ROUTES[3], grp))
