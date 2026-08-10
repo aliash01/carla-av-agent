@@ -2,7 +2,7 @@
 A staged autonomous driving agent and evaluation benchmark for CARLA 0.10 (UE5).
 
 ## Status
-Working: benchmark + baseline + v1.2 agent (5/5 clean). Next: v1.3 (lane discipline), then traffic rules.
+Working: benchmark + baseline + v1.3 agent (5/5, zero collisions). Next: v1.4 (steering geometry — lane discipline).
 
 ## Setup
 1. CARLA 0.10 (UE5) built from source; start the server:
@@ -87,6 +87,14 @@ route 3 — 0.15 minimized solid invasions, higher K weaves.
 First 5/5 clean batch: zero collisions, solids 66 → 29 across versions,
 faster than v1.1 despite tighter tracking. Remaining gap to baseline:
 raw invasion counts and speed.
+
+### v1.3 — turn anticipation (null result)
+
+Added route-curvature throttle: measure how much the road bends over the
+next ~8m (angle between consecutive route segments) and slow before the
+bend, not in it. No effect — route 2 unchanged at 45 invasions / 11 solid:
+at these speeds, remaining lane errors are steering geometry, not entry
+speed. Mechanism retained. Next: better steering (v1.4).
 
 ## Notes / future metrics
 - BehaviorAgent overshoots stop lines with long vehicles
