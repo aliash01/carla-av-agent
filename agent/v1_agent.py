@@ -5,6 +5,7 @@ CURVE_LOOKAHEAD = 4     # route bend measured over target_index .. +4 (~8m)
 MINTHROTTLE = 0.1
 MAXTHROTTLE = 0.25
 K = 0.15  # cross-track gain
+STEER_GAIN = math.pi / 6
 
 class V1Agent:
     def __init__(self, vehicle, destination, grp):
@@ -33,7 +34,7 @@ class V1Agent:
         By = loc.y - wp_tf.location.y
         cross = A.x * By - A.y * Bx
 
-        steer = max(-1.0, min(1.0, error / (math.pi / 2) - K * cross))
+        steer = max(-1.0, min(1.0, error / (STEER_GAIN) - K * cross))
 
         # slow before turns: throttle obeys the worst of current error
         # and how much the road itself bends over the next ~8m
