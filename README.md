@@ -2,7 +2,7 @@
 A staged autonomous driving agent and evaluation benchmark for CARLA 0.10 (UE5).
 
 ## Status
-Working: benchmark + baseline + v1.1 agent. Next: v1.2 (cross-track steering).
+Working: benchmark + baseline + v1.2 agent (5/5 clean). Next: v1.3 (lane discipline), then traffic rules.
 
 ## Setup
 1. CARLA 0.10 (UE5) built from source; start the server:
@@ -64,6 +64,29 @@ a waypoint (no more stall-orbits); throttle scales with steering error:
 controller corrects heading but not lateral offset (cross-track error).
 Planned route verified clear via debug drawing; fix = v1.2. Route 4 (parked
 car) now completes cleanly — slower turns + stall-proof ratchet.
+
+### v1.2 — cross-track steering (Stanley-style)
+
+Adds a second steering term: signed lateral offset from the route line
+(2D cross product of route direction × offset vector), so being off-line
+demands correction even when heading is correct:
+
+    steer = clamp(error / (π/2) - K · cross),  K = 0.15
+
+Sign determined empirically; K swept over {0.05, 0.1, 0.15, 0.2, 0.3} on
+route 3 — 0.15 minimized solid invasions, higher K weaves.
+
+| route | sim_time_s | collisions | solid_inv | lane_inv | avg km/h | completion |
+|-------|-----------|------------|-----------|----------|----------|------------|
+| 0     | 60.3      | 0          | 0         | 8        | 8.6      | 100%       |
+| 1     | 102.0     | 0          | 4         | 14       | 13.0     | 100%       |
+| 2     | 169.3     | 0          | 13        | 45       | 16.6     | 100%       |
+| 3     | 106.0     | 0          | 2         | 25       | 12.5     | 100%       |
+| 4     | 152.0     | 0          | 10        | 28       | 15.6     | 100%       |
+
+First 5/5 clean batch: zero collisions, solids 66 → 29 across versions,
+faster than v1.1 despite tighter tracking. Remaining gap to baseline:
+raw invasion counts and speed.
 
 ## Notes / future metrics
 - BehaviorAgent overshoots stop lines with long vehicles

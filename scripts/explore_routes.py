@@ -1,5 +1,3 @@
-# "C:\UnrealEngine5_carla\Engine\Binaries\Win64\UnrealEditor.exe" "C:\CarlaUE5\Unreal\CarlaUnreal\CarlaUnreal.uproject" -game -windowed -ResX=1280 -ResY=720
-
 import sys
 sys.path.insert(0, r'C:\CarlaUE5\PythonAPI\carla')
 import carla
