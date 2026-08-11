@@ -16,7 +16,7 @@ def run_route(client: carla.Client,
               agent_factory: Callable,
               route_def: dict,
               grp: GlobalRoutePlanner,
-              timeout_s: float = 300.0) -> dict:
+              timeout_s: float = 400.0) -> dict:
     """
     Run a single benchmark route in synchronous mode.
 
@@ -130,5 +130,5 @@ if __name__ == '__main__':
     world = client.get_world()
 
     grp = GlobalRoutePlanner(world.get_map(), 2.0)
-    print(run_batch(client, world, v1_factory, 'v1_agent'))
+    print(run_batch(client, world, v1_factory, 'v2_lights'))
     #print(run_route(client, world, v1_factory, ROUTES[2], grp))

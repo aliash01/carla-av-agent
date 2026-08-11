@@ -2,7 +2,7 @@
 A staged autonomous driving agent and evaluation benchmark for CARLA 0.10 (UE5).
 
 ## Status
-Working: benchmark + baseline + v1.4 agent (5/5, zero collisions, zero solid invasions - lane discipline at baseline level). Next: traffic - lights, obstacles, other vehicles.
+Working: v2 agent - lane discipline + traffic lights, 5/5 clean. Next: red-light-violation metric, then obstacles.
 
 ## Setup
 1. CARLA 0.10 (UE5) built from source; start the server:
@@ -112,6 +112,27 @@ swept {π/2..π/8} on route 2 - invasions fell monotonically to a plateau at
 
 Zero collisions, zero solid invasions; total invasions 22 vs baseline's 23.
 Lane discipline now at BehaviorAgent level; remaining gap is speed.
+
+### v2 - traffic lights
+
+Red-light compliance: light positions/stop lines from the map, built once at
+init (HD-map assumption); state via ground-truth query, isolated behind
+_perceive_traffic_light() for future camera swap. Physics-based braking
+(decel = v²/2d) with coast preference; finish-the-stop hold near the line;
+launch ramp for pull-away. Trigger volumes unused (unreliable per junction).
+
+Timeout raised to 400s (red phases cost ~30-60s each).
+
+| route | sim_time_s | collisions | solid_inv | lane_inv | avg km/h | completion |
+|-------|-----------|------------|-----------|----------|----------|------------|
+| 0     | 45.4      | 0          | 0         | 4        | 11.2     | 100%       |
+| 1     | 154.0     | 0          | 0         | 2        | 8.4      | 100%       |
+| 2     | 383.6     | 0          | 0         | 9        | 7.2      | 100%       |
+| 3     | 179.0     | 0          | 0         | 10       | 7.2      | 100%       |
+| 4     | 220.5     | 0          | 0         | 2        | 10.5     | 100%       |
+
+Known residuals: occasionally stops ~2m short of the line; lane changes
+occasionally abrupt; red-light violations not yet a benchmark metric.
 
 ## Notes / future metrics
 - BehaviorAgent overshoots stop lines with long vehicles
