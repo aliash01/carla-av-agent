@@ -143,6 +143,28 @@ on route 3.)
 Known residuals: occasionally stops ~2m short of the line; lane changes
 occasionally abrupt.
 
+### v2.1 - obstacle response
+
+Perception: _perceive_obstacle() - ground-truth actor query, route-membership
+filter (a vehicle counts only if it sits on our upcoming waypoints), returns
+bumper-to-bumper distance via bounding-box half-lengths. Same frozen-contract
+pattern as light perception; radar/lidar swap later.
+
+Response: physics braking (decel = v²/2d) to a FOLLOW_GAP (5m) short of the
+obstacle; held stop while blocked. No overtaking by design - future work.
+
+Scenario mechanism: routes may declare "parked_obstacle": <waypoint index>;
+the runner spawns a stationary vehicle there. Added as route 5 (route 2's
+geometry + parked car at waypoint 50) so routes 0-4 stay comparable.
+
+Route 5 result: timeout at 400s (correct - no overtaking), 0 collisions,
+completion 11.5% = pinned exactly at the obstacle.
+
+Validation note: an earlier "pass" was a false positive - a red light was
+doing the stopping, masking a centre-vs-bumper distance bug that a green-phase
+rerun exposed. Light phase is a hidden variable in any scenario near a
+junction.
+
 ## Notes / future metrics
 - BehaviorAgent overshoots stop lines with long vehicles
 - Straddles lanes when changing before junctions

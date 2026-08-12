@@ -44,6 +44,7 @@ def run_route(client: carla.Client,
     timed_out = False
     error = None
     recorder = None
+    obstacle = None
 
     try:
         bp_lib = world.get_blueprint_library() 
@@ -58,6 +59,13 @@ def run_route(client: carla.Client,
         settings.fixed_delta_seconds = FIXED_DELTA_S
         world.apply_settings(settings)
         trafficManager.set_synchronous_mode(True)
+
+        # scenario: parked vehicle on the route (optional per route definition)
+        if "parked_obstacle" in route_def:
+            obs_tf = route[min(route_def["parked_obstacle"], len(route) - 10)][0].transform
+            obs_tf.location.z += 0.5                     # drop onto the road, don't clip it
+            obstacle_bp = bp_lib.filter('vehicle.*')[1]
+            obstacle = world.try_spawn_actor(obstacle_bp, obs_tf)
 
         agent = agent_factory(vehicle, end) 
 
@@ -78,6 +86,8 @@ def run_route(client: carla.Client,
             recorder.stop()
         if vehicle is not None and vehicle.is_alive:
             vehicle.destroy()
+        if obstacle is not None and obstacle.is_alive:
+            obstacle.destroy()
 
         # return to async restoring settings
         settings = world.get_settings()
@@ -131,4 +141,4 @@ if __name__ == '__main__':
 
     grp = GlobalRoutePlanner(world.get_map(), 2.0)
     #print(run_batch(client, world, pilot_factory, 'v2_lights'))
-    print(run_route(client, world, pilot_factory, ROUTES[3], grp))
+    print(run_route(client, world, pilot_factory, ROUTES[5], grp))

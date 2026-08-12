@@ -8,7 +8,7 @@ K = 0.15  # cross-track gain
 STEER_GAIN = math.pi / 6
 COAST_DECEL = 0.8 
 MAX_DECEL = 6.0
-
+FOLLOW_GAP = 5.0  # metres kept clear behind a stopped obstacle
 
 class PilotAgent:
     def __init__(self, vehicle, destination, grp):
@@ -22,23 +22,38 @@ class PilotAgent:
         self.lights = [(l, wp.transform.location)
                        for l in world.get_actors().filter('traffic.traffic_light*')
                        for wp in l.get_stop_waypoints()]
+        self.half_length = vehicle.bounding_box.extent.x   # centre-to-bumper, for gap maths
 
     def run_step(self):
         loc = self.vehicle.get_location()
         speed = self.vehicle.get_velocity().length()
 
-        # -- longitudinal decision for red lights (never touches steering) --
-        red_dist = self._perceive_traffic_light()
-        light_hold = False   # suppress throttle while a red governs us
+        # -- longitudinal decisions (never touch steering) --
+        light_hold = False   # suppress throttle while a hazard governs us
         brake = 0.0
+
+        # red light: physics-brake to the stop line, hold until green
+        red_dist = self._perceive_traffic_light()
         if red_dist is not None and red_dist <= 20:
             light_hold = True
             if speed < 0.5 or (red_dist < 2.0 and speed < 2.0):
                 brake = 1.0        # stopped, or nearly there: finish the stop and hold until green
             else:
                 a_req = speed * speed / (2 * max(red_dist, 0.3))   # decel to stop AT the line
-                if a_req >= COAST_DECEL:                           # coasting won't shed enough
+                if a_req >= COAST_DECEL:
                     brake = min(1.0, a_req / MAX_DECEL)
+
+        # vehicle ahead on our route: physics-brake to a gap SHORT of it
+        obs_dist = self._perceive_obstacle()
+        if obs_dist is not None:
+            light_hold = True
+            gap_dist = obs_dist - FOLLOW_GAP
+            if gap_dist <= 0.5 or (speed < 0.5 and obs_dist < FOLLOW_GAP + 2):
+                brake = 1.0                                        # inside the gap, or held stopped
+            else:
+                a_req = speed * speed / (2 * gap_dist)             # decel to stop at the gap boundary
+                if a_req >= COAST_DECEL:
+                    brake = max(brake, min(1.0, a_req / MAX_DECEL))  # stricter hazard wins
 
         while (self._target_reached(loc)):
             self.target_index += 1
@@ -70,7 +85,7 @@ class PilotAgent:
         if speed < 2.0:
             throttle = max(throttle, 0.5 if speed < 0.5 else 0.35)
 
-        # red light overrides throttle (steering stays live throughout)
+        # hazard overrides throttle (steering stays live throughout)
         if light_hold:
             throttle = 0.0
 
@@ -115,6 +130,31 @@ class PilotAgent:
                 best = d
         return best
 
+    def _perceive_obstacle(self):
+        """Ground-truth obstacle perception (CARLA actor query). Returns the
+        BUMPER-TO-BUMPER distance to the nearest vehicle on our upcoming route
+        within ~30m, else None. Contract stays fixed when replaced by
+        radar/lidar detection in the perception stage."""
+        loc = self.vehicle.get_location()
+        upcoming = [p[0].transform.location
+                    for p in self.route[self.target_index:self.target_index + 15]]
+        best = None
+        for actor in self.vehicle.get_world().get_actors().filter('vehicle.*'):
+            if actor.id == self.vehicle.id:
+                continue                      # we are not our own obstacle
+            other_loc = actor.get_location()
+            d = other_loc.distance(loc)
+            if d > 30.0:
+                continue
+            # route membership: it blocks OUR path, not a neighbouring lane's
+            if not any(other_loc.distance(p) < 2.0 for p in upcoming):
+                continue
+            # centre-to-centre -> bumper-to-bumper: subtract both half-lengths
+            d = max(0.0, d - self.half_length - actor.bounding_box.extent.x)
+            if best is None or d < best:
+                best = d
+        return best
+    
     def _heading_error(self, loc, index, heading):
         """Signed angle between vehicle heading and direction to route[index]."""
         target = self.route[index][0].transform.location
