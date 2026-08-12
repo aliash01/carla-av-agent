@@ -5,7 +5,7 @@ from typing import Callable
 import carla
 from benchmark.metrics import MetricsRecorder
 from benchmark.routes import ROUTES
-from agent.v1_agent import V1Agent
+from agent.pilot_agent import PilotAgent
 from agents.navigation.global_route_planner import GlobalRoutePlanner
 
 FIXED_DELTA_S = 0.05
@@ -116,9 +116,9 @@ def run_batch(client, world, agent_factory, out_name: str) -> list:
 if __name__ == '__main__':
     from agents.navigation.behavior_agent import BehaviorAgent
 
-    def v1_factory(vehicle, destination):
+    def pilot_factory(vehicle, destination):
         grp = GlobalRoutePlanner(world.get_map(), 2.0)
-        return V1Agent(vehicle, destination, grp)
+        return PilotAgent(vehicle, destination, grp)
 
     def behavior_agent_factory(vehicle, destination):
         agent = BehaviorAgent(vehicle, behavior='normal')
@@ -130,5 +130,5 @@ if __name__ == '__main__':
     world = client.get_world()
 
     grp = GlobalRoutePlanner(world.get_map(), 2.0)
-    print(run_batch(client, world, v1_factory, 'v2_lights'))
-    #print(run_route(client, world, v1_factory, ROUTES[2], grp))
+    #print(run_batch(client, world, pilot_factory, 'v2_lights'))
+    print(run_route(client, world, pilot_factory, ROUTES[3], grp))

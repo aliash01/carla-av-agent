@@ -2,7 +2,7 @@
 A staged autonomous driving agent and evaluation benchmark for CARLA 0.10 (UE5).
 
 ## Status
-Working: v2 agent - lane discipline + traffic lights, 5/5 clean. Next: red-light-violation metric, then obstacles.
+Working: PilotAgent - lane discipline + traffic lights, 5/5 clean, 0 violations. Next: obstacle response, then live traffic.
 
 ## Setup
 1. CARLA 0.10 (UE5) built from source; start the server:
@@ -115,6 +115,8 @@ Lane discipline now at BehaviorAgent level; remaining gap is speed.
 
 ### v2 - traffic lights
 
+Agent: agent/pilot_agent.py (PilotAgent).
+
 Red-light compliance: light positions/stop lines from the map, built once at
 init (HD-map assumption); state via ground-truth query, isolated behind
 _perceive_traffic_light() for future camera swap. Physics-based braking
@@ -123,19 +125,27 @@ launch ramp for pull-away. Trigger volumes unused (unreliable per junction).
 
 Timeout raised to 400s (red phases cost ~30-60s each).
 
+New metric: red_light_violations (validated: 0 for the compliant agent, 7 for
+a light-blind agent on route 3; arming requires the stop line to lie on the
+benchmark route).
+
 | route | sim_time_s | collisions | solid_inv | lane_inv | avg km/h | completion |
 |-------|-----------|------------|-----------|----------|----------|------------|
 | 0     | 45.4      | 0          | 0         | 4        | 11.2     | 100%       |
 | 1     | 154.0     | 0          | 0         | 2        | 8.4      | 100%       |
 | 2     | 383.6     | 0          | 0         | 9        | 7.2      | 100%       |
-| 3     | 179.0     | 0          | 0         | 10       | 7.2      | 100%       |
+| 3     | 179.0     | 0          | 0         | 10      | 7.2      | 100%       |
 | 4     | 220.5     | 0          | 0         | 2        | 10.5     | 100%       |
 
+(Violations column absent: this batch predates the metric; spot-validated 0
+on route 3.)
+
 Known residuals: occasionally stops ~2m short of the line; lane changes
-occasionally abrupt; red-light violations not yet a benchmark metric.
+occasionally abrupt.
 
 ## Notes / future metrics
 - BehaviorAgent overshoots stop lines with long vehicles
 - Straddles lanes when changing before junctions
-- Red-light violation count (v1 crosses reds; not yet measured)
-- Lane-centering error (distance from lane centerline, per tick)
+- Lane-centring error (distance from lane centreline, per tick)
+- Baseline (BehaviorAgent) rows predate the red_light_violations column - re-run pending
+- Violation counter can double-count a light a blind agent re-passes; rankings unaffected

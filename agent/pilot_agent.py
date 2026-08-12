@@ -10,7 +10,7 @@ COAST_DECEL = 0.8
 MAX_DECEL = 6.0
 
 
-class V1Agent:
+class PilotAgent:
     def __init__(self, vehicle, destination, grp):
         self.vehicle = vehicle
         self.route = grp.trace_route(vehicle.get_location(), destination.location) # agent's own route copy (benchmark judges against its own)
@@ -28,7 +28,6 @@ class V1Agent:
         speed = self.vehicle.get_velocity().length()
 
         # -- longitudinal decision for red lights (never touches steering) --
-        # -- longitudinal decision for red lights (never touches steering) --
         red_dist = self._perceive_traffic_light()
         light_hold = False   # suppress throttle while a red governs us
         brake = 0.0
@@ -40,9 +39,6 @@ class V1Agent:
                 a_req = speed * speed / (2 * max(red_dist, 0.3))   # decel to stop AT the line
                 if a_req >= COAST_DECEL:                           # coasting won't shed enough
                     brake = min(1.0, a_req / MAX_DECEL)
-        
-        if red_dist is not None:
-            print(f"red_dist {red_dist:.1f} speed {speed:.1f} hold {light_hold} brake {brake:.2f}")
 
         while (self._target_reached(loc)):
             self.target_index += 1
