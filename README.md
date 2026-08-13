@@ -2,7 +2,7 @@
 A staged autonomous driving agent and evaluation benchmark for CARLA 0.10 (UE5).
 
 ## Status
-Working: PilotAgent - lane discipline + traffic lights, 5/5 clean, 0 violations. Next: obstacle response, then live traffic.
+Working: benchmark + baseline + PilotAgent v2.2 - lane discipline, traffic lights, obstacle response, live traffic, speed-limit control. Next: surround perception (adjacent/rear awareness), then overtaking.
 
 ## Setup
 1. CARLA 0.10 (UE5) built from source; start the server:
@@ -164,6 +164,48 @@ Validation note: an earlier "pass" was a false positive - a red light was
 doing the stopping, masking a centre-vs-bumper distance bug that a green-phase
 rerun exposed. Light phase is a hidden variable in any scenario near a
 junction.
+
+### v2.2 - live traffic and speed control
+
+Traffic scenarios: route definitions may declare
+`"traffic": {"vehicles": N, "seed": S}`; the runner seeds the Traffic Manager,
+spawns N autopiloted vehicles on fixed spawn points (the ego's excluded) and
+ticks once to settle registration before the run starts. Added as route 6
+(route 2's geometry + 20 vehicles) so routes 0-5 stay comparable.
+
+Motivation for speed control: with a ~15 km/h average against traffic driving
+~21+, NPCs repeatedly misjudged the ego - lane-changing into it and rear-ending
+it. A vehicle far below traffic speed is itself a hazard, so speed was raised to
+track the posted limit rather than a hand-tuned throttle ceiling. (Fault was not
+proven per-incident: a later seed change removed one shunt entirely.)
+
+Speed control: proportional control toward the posted speed limit, the target
+reduced by how sharply we are turning:
+
+    target = speed_limit x max(0.35, 1 - worst)
+    throttle = clamp(SPEED_KP x (target - speed))
+
+Following: FOLLOW_GAP reduced to 2.5m bumper-to-bumper; the hazard hold now
+applies only when a hazard actually demands braking, so a car ahead that needs
+no slowing no longer suppresses throttle.
+
+| route | traffic      | sim_time_s | collisions | solid_inv | lane_inv | avg km/h | violations | completion |
+|-------|--------------|-----------|------------|-----------|----------|----------|------------|------------|
+| 2     | none         | 188.0     | 0          | 0         | 8        | 14.7     | 0          | 100%       |
+| 6     | 20 vehicles  | 187.6     | 0          | 0         | 8        | 14.7     | 0          | 100%       |
+
+Traffic costs the agent nothing measurable: identical times and lane numbers
+with 20 vehicles present. Max speed rose 21.2 -> 28.7 km/h and route 2's time
+fell 383s -> 188s versus v2.1's fixed-ceiling throttle, with lane discipline
+unchanged.
+
+Findings: an NPC rear-ending the ego proved seed-specific - a different seed ran
+clean - so traffic scenarios must report their seed to be interpretable. The
+stop position at lights comes from CARLA's stop waypoint, typically ~1-2m
+upstream of the painted line; left as-is rather than offset by hand, since
+camera-based light detection will re-derive it. The collision counter inflates
+during sustained contact (one shunt read as 140 events); counting episodes
+rather than contacts is future work.
 
 ## Notes / future metrics
 - BehaviorAgent overshoots stop lines with long vehicles

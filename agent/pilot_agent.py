@@ -8,7 +8,8 @@ K = 0.15  # cross-track gain
 STEER_GAIN = math.pi / 6
 COAST_DECEL = 0.8 
 MAX_DECEL = 6.0
-FOLLOW_GAP = 5.0  # metres kept clear behind a stopped obstacle
+FOLLOW_GAP = 2.5  # metres kept clear behind a stopped obstacle
+SPEED_KP = 0.15
 
 class PilotAgent:
     def __init__(self, vehicle, destination, grp):
@@ -23,21 +24,23 @@ class PilotAgent:
                        for l in world.get_actors().filter('traffic.traffic_light*')
                        for wp in l.get_stop_waypoints()]
         self.half_length = vehicle.bounding_box.extent.x   # centre-to-bumper, for gap maths
+        self._last_obs = None   # previous tick's obstacle distance, for "gap opening?" checks
 
     def run_step(self):
         loc = self.vehicle.get_location()
         speed = self.vehicle.get_velocity().length()
 
         # -- longitudinal decisions (never touch steering) --
-        light_hold = False   # suppress throttle while a hazard governs us
+        hazard_hold = False   # suppress throttle only while a hazard actually demands slowing
         brake = 0.0
 
         # red light: physics-brake to the stop line, hold until green
         red_dist = self._perceive_traffic_light()
         if red_dist is not None and red_dist <= 20:
-            light_hold = True
+            hazard_hold = True
             if speed < 0.5 or (red_dist < 2.0 and speed < 2.0):
                 brake = 1.0        # stopped, or nearly there: finish the stop and hold until green
+                print(f"HELD at red_dist {red_dist:.2f}  (bumper ≈ {red_dist - self.half_length:.2f} from line)")
             else:
                 a_req = speed * speed / (2 * max(red_dist, 0.3))   # decel to stop AT the line
                 if a_req >= COAST_DECEL:
@@ -46,14 +49,17 @@ class PilotAgent:
         # vehicle ahead on our route: physics-brake to a gap SHORT of it
         obs_dist = self._perceive_obstacle()
         if obs_dist is not None:
-            light_hold = True
             gap_dist = obs_dist - FOLLOW_GAP
-            if gap_dist <= 0.5 or (speed < 0.5 and obs_dist < FOLLOW_GAP + 2):
-                brake = 1.0                                        # inside the gap, or held stopped
+            opening = self._last_obs is not None and obs_dist > self._last_obs + 0.05   # they're pulling away
+            if gap_dist <= 0.5 or (speed < 0.5 and obs_dist < FOLLOW_GAP + 2 and not opening):
+                hazard_hold = True
+                brake = 1.0                                        # inside the gap, or held while blocked
             else:
-                a_req = speed * speed / (2 * gap_dist)             # decel to stop at the gap boundary
-                if a_req >= COAST_DECEL:
-                    brake = max(brake, min(1.0, a_req / MAX_DECEL))  # stricter hazard wins
+                a_req = speed * speed / (2 * max(gap_dist, 0.3))
+                if a_req >= COAST_DECEL:                           # only hold when we actually need to slow
+                    hazard_hold = True
+                    brake = max(brake, min(1.0, a_req / MAX_DECEL))
+        self._last_obs = obs_dist
 
         while (self._target_reached(loc)):
             self.target_index += 1
@@ -76,17 +82,20 @@ class PilotAgent:
 
         steer = max(-1.0, min(1.0, error / (STEER_GAIN) - K * cross))
 
-        # slow before turns: throttle obeys the worst of current error
-        # and how much the road itself bends over the next ~8m
+        # how sharply we're turning: live error, or the road's bend over the next ~8m
         worst = max(abs(error), self._route_curvature())
-        throttle = max(MINTHROTTLE, MAXTHROTTLE - worst**2)
+
+        # target speed: the limit, reduced for how sharply we're turning
+        speed_kmh = 3.6 * speed
+        target_kmh = self._get_current_speed_limit() * max(0.35, 1.0 - worst)
+        throttle = max(0.0, min(1.0, SPEED_KP * (target_kmh - speed_kmh)))
 
         # pulling away: hold extra throttle until rolling (~2 m/s), not just at standstill
         if speed < 2.0:
             throttle = max(throttle, 0.5 if speed < 0.5 else 0.35)
 
         # hazard overrides throttle (steering stays live throughout)
-        if light_hold:
+        if hazard_hold:
             throttle = 0.0
 
         return carla.VehicleControl(throttle=throttle, steer=steer, brake=brake)
@@ -154,6 +163,9 @@ class PilotAgent:
             if best is None or d < best:
                 best = d
         return best
+
+    def _get_current_speed_limit(self):
+        return self.vehicle.get_speed_limit() # for now use CARLA system for grabbing speed limit, in future may be changed to suit more realistic scenario
     
     def _heading_error(self, loc, index, heading):
         """Signed angle between vehicle heading and direction to route[index]."""

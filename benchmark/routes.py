@@ -5,4 +5,5 @@ ROUTES = [
     {"id": 3, "start": 0, "end": 109},
     {"id": 4, "start": 0, "end": 57},
     {"id": 5, "start": 0, "end": 42, "parked_obstacle": 50},
+    {"id": 6, "start": 0, "end": 42, "traffic": {"vehicles": 20, "seed": 1234}},
 ]
