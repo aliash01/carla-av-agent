@@ -207,6 +207,68 @@ camera-based light detection will re-derive it. The collision counter inflates
 during sustained contact (one shunt read as 140 events); counting episodes
 rather than contacts is future work.
 
+### v2.3 - surround perception (blind-spot awareness)
+
+Capability only: the agent can now inspect the lane beside it. No behaviour
+change - nothing calls this yet; the consumer is the overtaking chapter.
+
+Perception tier: ground truth - see Assumptions.
+
+_perceive_lane(side, loc) returns None if the lane on that side is unusable
+(absent, not Driving, or oncoming - detected by lane_id sign flip, since
+lane_type alone would permit steering into oncoming traffic), otherwise:
+
+    {"beside": bool,                    # a vehicle overlaps our length: veto
+     "ahead":  (gap_m, closing_ms),     # nearest ahead in that lane, or None
+     "behind": (gap_m, closing_ms)}     # nearest behind in that lane, or None
+
+Gaps are bumper-to-bumper measured along our heading; closing > 0 means the gap
+is shrinking, for both ahead and behind, so consumers can apply one threshold.
+Lane membership uses a chain of that lane's waypoints ~20m fore and aft
+(next()/previous()), the same membership pattern as route and light perception.
+
+Ground-truth actor query for now, behind the usual frozen contract - the
+real-world analogue is radar (production blind-spot monitors use it; closing
+speed is measured natively).
+
+Validated by trace inspection on route 6 rather than by benchmark numbers,
+since no behaviour changed: a vehicle overtaking in the right lane read as
+behind/closing, then beside (veto), then ahead with an opening gap, while a
+second vehicle further up read as ahead throughout. Oncoming lanes correctly
+returned None.
+
+Rules drafted for the overtaking chapter: beside = wait and adjust speed, not
+abandon; the ahead margin must allow stopping if they brake hard; the behind
+margin must allow reaching speed before they arrive (time-to-collision, ~2-3s);
+and a lane change is a re-evaluated state with an abort path, not a committed
+action.
+
+## Assumptions
+
+The agent currently assumes solved perception and localisation, and says so
+explicitly rather than implying otherwise:
+
+- **Road geometry** comes from the map (OpenDRIVE via CARLA): lanes, waypoints,
+  junctions, stop-line positions, speed limits. Real-world analogue: an HD map
+  plus localisation (Waymo-style). Map-light stacks (Tesla-style) derive this
+  from cameras instead - a genuine open architecture argument, not a settled one.
+- **Other vehicles** (positions, extents, velocities) come from ground-truth
+  actor queries. Real-world analogue: radar for closing speed and blind spots,
+  camera/lidar for detection and classification.
+- **Traffic light state** comes from a ground-truth query. Real-world analogue:
+  camera detection of the light head, with geometry still supplied by the map.
+
+Every one of these sits behind a `_perceive_*` method with a fixed contract
+(distance-or-None, or a small dict), so the perception stage swaps the method
+body without touching any decision logic. That staging is deliberate: it keeps
+attribution clean while the driving logic is being built - a failure is either
+the logic or the sensing, never ambiguously both.
+
+What is *not* assumed away: vehicle dynamics (the benchmark vehicle is a
+long-wheelbase Sprinter, deliberately unforgiving), control (every steering and
+throttle command is computed here), and judgement (the benchmark scores from its
+own ground truth, independently of what the agent believed).
+
 ## Notes / future metrics
 - BehaviorAgent overshoots stop lines with long vehicles
 - Straddles lanes when changing before junctions

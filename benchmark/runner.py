@@ -162,4 +162,4 @@ if __name__ == '__main__':
 
     grp = GlobalRoutePlanner(world.get_map(), 2.0)
     #print(run_batch(client, world, pilot_factory, 'v2_lights'))
-    print(run_route(client, world, pilot_factory, ROUTES[2], grp))
+    print(run_route(client, world, pilot_factory, ROUTES[6], grp))

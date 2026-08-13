@@ -25,10 +25,12 @@ class PilotAgent:
                        for wp in l.get_stop_waypoints()]
         self.half_length = vehicle.bounding_box.extent.x   # centre-to-bumper, for gap maths
         self._last_obs = None   # previous tick's obstacle distance, for "gap opening?" checks
+        self.map = world.get_map()
 
     def run_step(self):
         loc = self.vehicle.get_location()
         speed = self.vehicle.get_velocity().length()
+        print('L', self._perceive_lane('left', loc), 'R', self._perceive_lane('right', loc))
 
         # -- longitudinal decisions (never touch steering) --
         hazard_hold = False   # suppress throttle only while a hazard actually demands slowing
@@ -165,6 +167,76 @@ class PilotAgent:
 
     def _get_current_speed_limit(self):
         return self.vehicle.get_speed_limit() # for now use CARLA system for grabbing speed limit, in future may be changed to suit more realistic scenario
+
+    def _perceive_lane(self, side, loc):
+        """Ground-truth blind-spot perception (CARLA actor query) for the lane
+        on `side` ('left'/'right'). Returns None if that lane is unusable
+        (absent, not drivable, or oncoming), else a dict:
+            {"beside": True/False,
+             "ahead":  (gap_m, closing_ms) or None,
+             "behind": (gap_m, closing_ms) or None}
+        beside=True is an absolute veto: a vehicle overlaps our length in that
+        lane. closing > 0 means the gap is shrinking. Contract stays fixed when
+        replaced by radar/lidar in the perception stage."""
+        wp = self.map.get_waypoint(loc)
+        candidate = wp.get_left_lane() if side == 'left' else wp.get_right_lane()
+        if candidate is None or candidate.lane_type != carla.LaneType.Driving:
+            return None
+        if (candidate.lane_id > 0) != (wp.lane_id > 0):      # sign flip = oncoming
+            return None
+
+        # the lane as a stretch: ~20m ahead and ~20m behind our position
+        chain = [candidate.transform.location]
+        w = candidate
+        for _ in range(10):
+            nxt = w.next(2.0)
+            if not nxt:
+                break
+            w = nxt[0]
+            chain.append(w.transform.location)
+        w = candidate
+        for _ in range(10):
+            prv = w.previous(2.0)
+            if not prv:
+                break
+            w = prv[0]
+            chain.append(w.transform.location)
+
+        f = self.vehicle.get_transform().get_forward_vector()
+        my_v = self.vehicle.get_velocity()
+        my_along = my_v.x * f.x + my_v.y * f.y          # our speed along our heading
+        beside = False
+        ahead = behind = None
+
+        for actor in self.vehicle.get_world().get_actors().filter('vehicle.*'):
+            if actor.id == self.vehicle.id:
+                continue
+            other_loc = actor.get_location()
+            if other_loc.distance(loc) > 40.0:
+                continue
+            if not any(other_loc.distance(p) < 2.0 for p in chain):
+                continue                               # not in that lane
+
+            other_half = actor.bounding_box.extent.x
+            along = f.x * (other_loc.x - loc.x) + f.y * (other_loc.y - loc.y)
+
+            # overlapping our length: neither ahead nor behind - beside us
+            if abs(along) < self.half_length + other_half:
+                beside = True
+                continue
+
+            gap = abs(along) - self.half_length - other_half   # bumper-to-bumper along the lane
+            ov = actor.get_velocity()
+            their_along = ov.x * f.x + ov.y * f.y
+            closing = (my_along - their_along) if along > 0 else (their_along - my_along)
+            if along > 0:
+                if ahead is None or gap < ahead[0]:
+                    ahead = (gap, closing)
+            else:
+                if behind is None or gap < behind[0]:
+                    behind = (gap, closing)
+
+        return {"beside": beside, "ahead": ahead, "behind": behind}
     
     def _heading_error(self, loc, index, heading):
         """Signed angle between vehicle heading and direction to route[index]."""
