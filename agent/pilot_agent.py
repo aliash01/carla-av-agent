@@ -40,7 +40,6 @@ class PilotAgent:
             hazard_hold = True
             if speed < 0.5 or (red_dist < 2.0 and speed < 2.0):
                 brake = 1.0        # stopped, or nearly there: finish the stop and hold until green
-                print(f"HELD at red_dist {red_dist:.2f}  (bumper ≈ {red_dist - self.half_length:.2f} from line)")
             else:
                 a_req = speed * speed / (2 * max(red_dist, 0.3))   # decel to stop AT the line
                 if a_req >= COAST_DECEL:
