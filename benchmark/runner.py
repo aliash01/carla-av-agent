@@ -45,6 +45,7 @@ def run_route(client: carla.Client,
     error = None
     recorder = None
     obstacle = None
+    traffic_vehicles = []
 
     try:
         bp_lib = world.get_blueprint_library() 
@@ -67,6 +68,22 @@ def run_route(client: carla.Client,
             obstacle_bp = bp_lib.filter('vehicle.*')[1]
             obstacle = world.try_spawn_actor(obstacle_bp, obs_tf)
 
+        # scenario: TM-driven traffic (optional per route definition)
+        if "traffic" in route_def:
+            cfg = route_def["traffic"]
+            trafficManager.set_random_device_seed(cfg["seed"])   # pin the TM's dice
+            traffic_bps = bp_lib.filter('vehicle.*')
+            for i, sp in enumerate(spawnpoints):
+                if len(traffic_vehicles) >= cfg["vehicles"]:
+                    break
+                if i == route_def["start"]:
+                    continue                                     # ego's spot stays free
+                tv = world.try_spawn_actor(traffic_bps[i % len(traffic_bps)], sp)
+                if tv is not None:
+                    tv.set_autopilot(True, trafficManager.get_port())
+                    traffic_vehicles.append(tv)
+            world.tick()   # let spawns + TM registration settle before the run starts
+
         agent = agent_factory(vehicle, end) 
 
         while not agent.done():
@@ -88,6 +105,10 @@ def run_route(client: carla.Client,
             vehicle.destroy()
         if obstacle is not None and obstacle.is_alive:
             obstacle.destroy()
+        for tv in traffic_vehicles:
+            if tv.is_alive:
+                tv.set_autopilot(False)
+                tv.destroy()
 
         # return to async restoring settings
         settings = world.get_settings()
@@ -141,4 +162,4 @@ if __name__ == '__main__':
 
     grp = GlobalRoutePlanner(world.get_map(), 2.0)
     #print(run_batch(client, world, pilot_factory, 'v2_lights'))
-    print(run_route(client, world, pilot_factory, ROUTES[5], grp))
+    print(run_route(client, world, pilot_factory, ROUTES[2], grp))
