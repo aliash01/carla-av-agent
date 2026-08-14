@@ -2,7 +2,7 @@
 A staged autonomous driving agent and evaluation benchmark for CARLA 0.10 (UE5).
 
 ## Status
-Working: benchmark + baseline + PilotAgent v2.2 - lane discipline, traffic lights, obstacle response, live traffic, speed-limit control. Next: surround perception (adjacent/rear awareness), then overtaking.
+Working: benchmark + baseline + PilotAgent v2.4 - lane discipline, traffic lights, obstacle response, live traffic, speed-limit control, unsticking past blockers. Next: sampling-based local planner (feasible trajectories + footprint collision checks), or camera perception.
 
 ## Setup
 1. CARLA 0.10 (UE5) built from source; start the server:
@@ -242,6 +242,45 @@ abandon; the ahead margin must allow stopping if they brake hard; the behind
 margin must allow reaching speed before they arrive (time-to-collision, ~2-3s);
 and a lane change is a re-evaluated state with an abort path, not a committed
 action.
+
+### v2.4 - unsticking (reverse and go around)
+
+Route 5's parked blocker now completes: the agent waits, reverses to make room,
+swings into the adjacent lane, passes, and rejoins the route.
+
+Manoeuvre state machine (FOLLOWING -> REVERSING -> PREPARING -> CHANGING ->
+RETURNING), re-evaluated every tick with abort paths, rather than a committed
+action. Gate order before any manoeuvre: stalled >10s behind a stationary
+vehicle -> no red light governing -> upcoming route is LANEFOLLOW (no
+manoeuvring in or near junctions) -> nothing else queued beyond the blocker ->
+an adjacent lane that exists, is same-direction, and is clear with adequate
+ahead/behind gaps and time-to-collision.
+
+The manoeuvre is a *local deviation*, not a replan: the global route stays the
+reference and a lane_offset shifts the reference line sideways, so aborting is
+free and the benchmark's completion metric keeps working. Rejoining tapers the
+offset back to zero.
+
+Reversing has its own control path: it aims at a waypoint behind along the lane,
+measures error against the reversed heading, and negates the steer command
+(turning the wheels one way swings the tail the other). Rear perception in our
+own lane was added for it.
+
+| route | scenario        | sim_time_s | collisions | solid_inv | lane_inv | avg km/h | completion |
+|-------|-----------------|-----------|------------|-----------|----------|----------|------------|
+| 5     | parked blocker  | 193.6     | 0          | 0         | 15       | 14.4     | 100%       |
+
+Debugging note worth recording: the manoeuvre appeared to be a geometry problem
+(clearance, reverse distance) and resisted every geometric fix. It was a
+*controller* problem - the heading term aimed at the unshifted route waypoint and
+overpowered the cross-track offset, so the van steered almost straight into the
+blocker. Shifting the aim point sideways by the same offset made both terms agree
+and the manoeuvre worked immediately. Deciding correctly and executing correctly
+are separate failures.
+
+Limits: same-direction lanes only (overtaking into oncoming traffic needs
+legality and oncoming-gap logic - future work); triggers on stationary blockers,
+not slow-rolling ones; reversing follows the lane but is not path-planned.
 
 ## Assumptions
 
