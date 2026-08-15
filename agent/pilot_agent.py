@@ -54,6 +54,7 @@ class PilotAgent:
         self._overtake_side = None
         self._blocker_ahead_index = None
         self._blocker_loc = None
+        self._reverse_start = None      # where reversing began, to cap distance backed
         
 
     def run_step(self):
@@ -232,17 +233,15 @@ class PilotAgent:
             return None
         red = self._perceive_traffic_light()
         if red is not None and red <= 25.0:
-            print("gate: red light", red); return None
+            return None
         upcoming = self.route[self.target_index:self.target_index + 10]
         if any(opt != RoadOption.LANEFOLLOW for _, opt in upcoming):
-            print("gate: junction", [opt.name for _, opt in upcoming]); return None
+            return None
         if self._queue_beyond(loc, obs_dist):
-            print("gate: queue beyond"); return None
+            return None
         for side in ('left', 'right'):
             if self._lane_is_safe(side, loc):
                 return side
-        print("gate: no safe lane",
-              self._perceive_lane('left', loc), self._perceive_lane('right', loc))
         return None
 
     def _queue_beyond(self, loc, obs_dist):
