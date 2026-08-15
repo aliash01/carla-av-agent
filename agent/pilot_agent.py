@@ -7,7 +7,7 @@ class Manoeuvre(Enum):
     RETURNING = auto()
     REVERSING = auto()
 
-import carla, math
+import carla, math, os, csv
 from agents.navigation.local_planner import RoadOption
 
 STEERING_LOOKAHEAD = 2  # waypoints ahead for steering aim
@@ -33,7 +33,7 @@ REVERSE_CLEAR_M = 6.0           # clearance from the blocker that makes a swing-
 REAR_CLEAR_M = 10.0              # required clear space behind us before reversing
 
 class PilotAgent:
-    def __init__(self, vehicle, destination, grp):
+    def __init__(self, vehicle, destination, grp, trace_path=None):
         self.vehicle = vehicle
         self.route = grp.trace_route(vehicle.get_location(), destination.location) # agent's own route copy (benchmark judges against its own)
         self.target_index = 0
@@ -55,9 +55,31 @@ class PilotAgent:
         self._blocker_ahead_index = None
         self._blocker_loc = None
         self._reverse_start = None      # where reversing began, to cap distance backed
-        
+
+        # opt-in control trace: one CSV row per tick, for before/after equivalence diffs
+        self._trace = None
+        self._trace_tick = 0
+        if trace_path is not None:
+            os.makedirs(os.path.dirname(trace_path), exist_ok=True)
+            self._trace = open(trace_path, 'w', newline='')
+            self._trace_writer = csv.writer(self._trace)
+            self._trace_writer.writerow(
+                ['tick', 'throttle', 'steer', 'brake', 'reverse', 'state', 'lane_offset'])
 
     def run_step(self):
+        """Thin wrapper: compute the control, optionally trace it, return it unchanged."""
+        control = self._run_step()
+        if self._trace is not None:
+            # repr() keeps full float precision: the diff must catch tiny divergences
+            self._trace_writer.writerow(
+                [self._trace_tick, repr(control.throttle), repr(control.steer),
+                 repr(control.brake), int(control.reverse),
+                 self.state.name, repr(self.lane_offset)])
+            self._trace.flush()
+        self._trace_tick += 1
+        return control
+
+    def _run_step(self):
         loc = self.vehicle.get_location()
         speed = self.vehicle.get_velocity().length()
 

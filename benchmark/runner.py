@@ -84,7 +84,12 @@ def run_route(client: carla.Client,
                     traffic_vehicles.append(tv)
             world.tick()   # let spawns + TM registration settle before the run starts
 
-        agent = agent_factory(vehicle, end) 
+        # lights keep cycling between runs, so each run would otherwise start at an
+        # arbitrary phase - measured 34s of variance on route 2 from this alone.
+        # Reset to phase zero so runs are reproducible and agents comparable.
+        world.reset_all_traffic_lights()
+
+        agent = agent_factory(vehicle, end)
 
         while not agent.done():
             world.tick()

@@ -282,6 +282,32 @@ Limits: same-direction lanes only (overtaking into oncoming traffic needs
 legality and oncoming-gap logic - future work); triggers on stationary blockers,
 not slow-rolling ones; reversing follows the lane but is not path-planned.
 
+### Benchmark reproducibility and control traces
+
+No agent behaviour change - measurement infrastructure ahead of a controller
+refactor.
+
+Light-phase reset: lights cycle freely between runs, so each run started at
+whatever phase the world clock happened to be at - measured 34s of sim-time
+variance on empty route 2 from this alone (one extra red). The runner now
+calls reset_all_traffic_lights() before the agent is built. Repeat runs of
+routes 2, 5 and 6 became metric-identical, all landing on exactly 187.65s:
+red lights act as resynchronisation points, absorbing time lost mid-route
+and releasing at a fixed phase.
+
+Control traces: PilotAgent takes an optional trace_path and writes one CSV
+row per tick (throttle, steer, brake, reverse, state, lane_offset). Purpose:
+before/after equivalence diffs for refactors, replacing ad-hoc prints.
+
+Finding: CARLA physics is not bit-deterministic. Same-code trace pairs
+diverge from tick 2 (~1e-7 in steer), amplified to full-scale single-tick
+differences at decision thresholds, and to visibly divergent steering with
+traffic present (route 6). Behaviour is deterministic regardless: identical
+tick counts, manoeuvre state sequences and metrics across all repeat runs.
+Refactor equivalence is therefore judged on state sequences, tick counts and
+metrics, with float diffs bounded by the measured same-code noise band
+(~0.15 on empty routes) - not byte equality.
+
 ## Assumptions
 
 The agent currently assumes solved perception and localisation, and says so
