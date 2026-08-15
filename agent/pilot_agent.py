@@ -12,8 +12,6 @@ from agents.navigation.local_planner import RoadOption
 
 STEERING_LOOKAHEAD = 2  # waypoints ahead for steering aim
 CURVE_LOOKAHEAD = 4     # route bend measured over target_index .. +4 (~8m)
-MINTHROTTLE = 0.1
-MAXTHROTTLE = 0.25
 K = 0.15  # cross-track gain
 STEER_GAIN = math.pi / 6
 COAST_DECEL = 0.8 
@@ -52,7 +50,6 @@ class PilotAgent:
         self._blocked_ticks = 0
         self._prepare_ticks = 0
         self._overtake_side = None
-        self._blocker_ahead_index = None
         self._blocker_loc = None
         self._reverse_start = None      # where reversing began, to cap distance backed
 
@@ -80,70 +77,113 @@ class PilotAgent:
         return control
 
     def _run_step(self):
-        loc = self.vehicle.get_location()
-        speed = self.vehicle.get_velocity().length()
+        """One tick: sense -> assess hazards -> manoeuvre -> track route -> control.
+        Hazard assessment runs BEFORE the manoeuvre update, so it reads last
+        tick's state; the manoeuvre machine may amend the hazard afterwards."""
+        obs = self._sense()
+        hazard = self._assess_hazards(obs)
 
-        # -- longitudinal decisions (never touch steering) --
-        hazard_hold = False   # suppress throttle only while a hazard actually demands slowing
-        brake = 0.0
-
-        # red light: physics-brake to the stop line, hold until green
-        red_dist = self._perceive_traffic_light()
-        if red_dist is not None and red_dist <= 20:
-            hazard_hold = True
-            if speed < 0.5 or (red_dist < 2.0 and speed < 2.0):
-                brake = 1.0        # stopped, or nearly there: finish the stop and hold until green
-            else:
-                a_req = speed * speed / (2 * max(red_dist, 0.3))   # decel to stop AT the line
-                if a_req >= COAST_DECEL:
-                    brake = min(1.0, a_req / MAX_DECEL)
-
-        # vehicle ahead on our route: physics-brake to a gap SHORT of it
-        obs_dist = self._perceive_obstacle()
-        if obs_dist is not None:
-            gap_dist = obs_dist - FOLLOW_GAP
-            opening = self._last_obs is not None and obs_dist > self._last_obs + 0.05   # they're pulling away
-            held = gap_dist <= 0.5 or (speed < 0.5 and obs_dist < FOLLOW_GAP + 2 and not opening)
-            if held:
-                if self.state is not Manoeuvre.CHANGING:      # don't brake for the car we're passing
-                    hazard_hold = True
-                    brake = 1.0
-                if speed < 0.1:
-                    self._blocked_ticks += 1                  # accruing stall time
-            else:
-                a_req = speed * speed / (2 * max(gap_dist, 0.3))
-                if a_req >= COAST_DECEL and self.state is not Manoeuvre.CHANGING:
-                    hazard_hold = True
-                    brake = max(brake, min(1.0, a_req / MAX_DECEL))
-                self._blocked_ticks = 0
-        else:
-            self._blocked_ticks = 0
-        self._last_obs = obs_dist
-
-        # -- reversing has its own control path (rear target, inverted kinematics) --
+        # reversing has its own control path (rear target, inverted kinematics)
         if self.state is Manoeuvre.REVERSING:
+            loc = obs["loc"]
             backed = self._reverse_start.distance(loc) if self._reverse_start is not None else 0.0
-            rear = self._perceive_rear(loc)
-            enough_room = obs_dist is None or obs_dist >= REVERSE_CLEAR_M
-            if enough_room or backed >= REVERSE_MAX_M or (rear is not None and rear < 3.0):
+            enough_room = obs["obstacle"] is None or obs["obstacle"] >= REVERSE_CLEAR_M
+            if (enough_room or backed >= REVERSE_MAX_M
+                    or (obs["rear"] is not None and obs["rear"] < 3.0)):
                 self.state = Manoeuvre.PREPARING
                 self._prepare_ticks = 0
                 return carla.VehicleControl(brake=1.0)        # settle before swinging out
             return self._reverse_step(loc)
 
-        # -- manoeuvre state machine: a local deviation from the global route --
+        self._update_manoeuvre(obs, hazard)
+
+        if self._advance_route(obs["loc"]):
+            return carla.VehicleControl(brake=1.0)            # route finished: stop and stay
+
+        steer, heading_error = self._lateral_control(obs)
+        throttle, brake = self._longitudinal_control(obs, hazard, heading_error)
+        return carla.VehicleControl(throttle=throttle, steer=steer, brake=brake)
+
+    def _sense(self):
+        """Build this tick's perception snapshot - the ONLY caller of _perceive_*.
+        Everything below reads the snapshot, never the sensors: one perception
+        pass per tick, and every decision sees the same world."""
+        loc = self.vehicle.get_location()
+        return {"loc": loc,
+                "speed": self.vehicle.get_velocity().length(),
+                "light": self._perceive_traffic_light(),
+                "obstacle": self._perceive_obstacle(),
+                "lane_left": self._perceive_lane('left', loc),
+                "lane_right": self._perceive_lane('right', loc),
+                "rear": self._perceive_rear(loc),
+                "speed_limit": self._get_current_speed_limit()}
+
+    def _assess_hazards(self, obs):
+        """This-tick longitudinal judgement: how hard to brake, whether to
+        suppress throttle, and whether we are pinned behind an obstacle (held).
+        Never touches steering. Reads self.state (last tick's - see _run_step).
+        Keeps one memory of its own, _last_obs, for the pulling-away check."""
+        hazard = {"hold": False,   # suppress throttle only while a hazard actually demands slowing
+                  "brake": 0.0,
+                  "held": False}   # pinned behind an obstacle this tick (manoeuvre machine counts these)
+        speed = obs["speed"]
+
+        # red light: physics-brake to the stop line, hold until green
+        red_dist = obs["light"]
+        if red_dist is not None and red_dist <= 20:
+            hazard["hold"] = True
+            if speed < 0.5 or (red_dist < 2.0 and speed < 2.0):
+                hazard["brake"] = 1.0     # stopped, or nearly there: finish the stop and hold until green
+            else:
+                a_req = speed * speed / (2 * max(red_dist, 0.3))   # decel to stop AT the line
+                if a_req >= COAST_DECEL:
+                    hazard["brake"] = min(1.0, a_req / MAX_DECEL)
+
+        # vehicle ahead on our route: physics-brake to a gap SHORT of it
+        obs_dist = obs["obstacle"]
+        if obs_dist is not None:
+            gap_dist = obs_dist - FOLLOW_GAP
+            opening = self._last_obs is not None and obs_dist > self._last_obs + 0.05   # they're pulling away
+            held = gap_dist <= 0.5 or (speed < 0.5 and obs_dist < FOLLOW_GAP + 2 and not opening)
+            hazard["held"] = held
+            if held:
+                if self.state is not Manoeuvre.CHANGING:      # don't brake for the car we're passing
+                    hazard["hold"] = True
+                    hazard["brake"] = 1.0
+            else:
+                a_req = speed * speed / (2 * max(gap_dist, 0.3))
+                if a_req >= COAST_DECEL and self.state is not Manoeuvre.CHANGING:
+                    hazard["hold"] = True
+                    hazard["brake"] = max(hazard["brake"], min(1.0, a_req / MAX_DECEL))
+        self._last_obs = obs_dist
+        return hazard
+
+    def _update_manoeuvre(self, obs, hazard):
+        """Manoeuvre state machine: a local deviation from the global route.
+        Owns all cross-tick manoeuvre memory (stall counter, prepare counter,
+        blocker position) and sets lane_offset. May amend the hazard - PREPARING
+        holds the brake on so we don't creep back onto the blocker's bumper."""
+        # stall counter: hazard reports this tick's fact, the machine owns the history
+        if obs["obstacle"] is None:
+            self._blocked_ticks = 0
+        elif hazard["held"]:
+            if obs["speed"] < 0.1:
+                self._blocked_ticks += 1                      # accruing stall time
+        else:
+            self._blocked_ticks = 0
+
+        loc = obs["loc"]
         wp_here = self.map.get_waypoint(loc)
         lane_w = wp_here.lane_width if wp_here else 3.5
 
         if self.state is Manoeuvre.FOLLOWING:
             self.lane_offset = 0.0
-            side = self._unstick_gate(loc, obs_dist) if obs_dist is not None else None
+            side = self._unstick_gate(obs) if obs["obstacle"] is not None else None
             if side is not None:
                 self._overtake_side = side
                 self._prepare_ticks = 0
-                if obs_dist < REVERSE_CLEAR_M:
-                    rear = self._perceive_rear(loc)
-                    if rear is None or rear >= REAR_CLEAR_M:
+                if obs["obstacle"] < REVERSE_CLEAR_M:
+                    if obs["rear"] is None or obs["rear"] >= REAR_CLEAR_M:
                         self._reverse_start = loc
                         self.state = Manoeuvre.REVERSING      # too close to swing out: back up first
                     else:
@@ -153,16 +193,16 @@ class PilotAgent:
 
         elif self.state is Manoeuvre.PREPARING:
             self.lane_offset = 0.0
-            if not self._lane_is_safe(self._overtake_side, loc):
+            if not self._lane_is_safe(self._overtake_side, obs):
                 self.state = Manoeuvre.FOLLOWING              # abort before moving
             else:
                 self._prepare_ticks += 1
-                hazard_hold = True                            # stay put: don't creep back onto the bumper
-                brake = 1.0
+                hazard["hold"] = True                         # stay put: don't creep back onto the bumper
+                hazard["brake"] = 1.0
                 if self._prepare_ticks >= PREPARE_TICKS:
                     # remember where the blocker is, so we know when we're past it
                     f0 = self.vehicle.get_transform().get_forward_vector()
-                    ahead_m = (obs_dist or 0.0) + self.half_length + 2.4
+                    ahead_m = (obs["obstacle"] or 0.0) + self.half_length + 2.4
                     self._blocker_loc = carla.Location(
                         x=loc.x + f0.x * ahead_m, y=loc.y + f0.y * ahead_m, z=loc.z)
                     self.state = Manoeuvre.CHANGING
@@ -185,16 +225,24 @@ class PilotAgent:
                 self._blocker_loc = None
                 self.state = Manoeuvre.FOLLOWING
 
-        while (self._target_reached(loc)):
+    def _advance_route(self, loc):
+        """Ratchet target_index past reached waypoints; True when the route is done."""
+        while self._target_reached(loc):
             self.target_index += 1
             if self.done():
-                return carla.VehicleControl(brake=1.0)
+                return True
+        return False
 
+    def _lateral_control(self, obs):
+        """Steering: aim at a waypoint ahead, shifted sideways by lane_offset during
+        a manoeuvre so the heading term pulls the same way as the cross-track term
+        instead of fighting it, plus a cross-track correction against the (equally
+        shifted) route line. Returns (steer, heading_error) - the error also feeds
+        longitudinal control, which slows for how sharply we're turning."""
+        loc = obs["loc"]
         f = self.vehicle.get_transform().get_forward_vector()
         heading = math.atan2(f.y, f.x)
 
-        # steering: aim at a waypoint ahead, shifted sideways during a manoeuvre so the
-        # heading term pulls the same way as the cross-track term instead of fighting it
         aim_index = min(self.target_index + STEERING_LOOKAHEAD, len(self.route) - 1)
         wp_aim = self.route[aim_index][0].transform
         A_aim = wp_aim.get_forward_vector()
@@ -215,28 +263,33 @@ class PilotAgent:
         cross = A.x * By - A.y * Bx
 
         steer = max(-1.0, min(1.0, error / (STEER_GAIN) - K * (cross - self.lane_offset)))
+        return steer, error
 
+    def _longitudinal_control(self, obs, hazard, heading_error):
+        """Throttle and brake: P-control toward the speed limit, target reduced by
+        how sharply we're turning; launch ramp from standstill; the hazard's hold
+        overrides throttle (steering stays live throughout)."""
         # how sharply we're turning: live error, or the road's bend over the next ~8m
-        worst = max(abs(error), self._route_curvature())
+        worst = max(abs(heading_error), self._route_curvature())
 
         # target speed: the limit, reduced for how sharply we're turning
+        speed = obs["speed"]
         speed_kmh = 3.6 * speed
-        target_kmh = self._get_current_speed_limit() * max(0.35, 1.0 - worst)
+        target_kmh = obs["speed_limit"] * max(0.35, 1.0 - worst)
         throttle = max(0.0, min(1.0, SPEED_KP * (target_kmh - speed_kmh)))
 
         # pulling away: hold extra throttle until rolling (~2 m/s), not just at standstill
         if speed < 2.0:
             throttle = max(throttle, 0.5 if speed < 0.5 else 0.35)
 
-        # hazard overrides throttle (steering stays live throughout)
-        if hazard_hold:
+        if hazard["hold"]:
             throttle = 0.0
 
-        return carla.VehicleControl(throttle=throttle, steer=steer, brake=brake)
+        return throttle, hazard["brake"]
     
-    def _lane_is_safe(self, side, loc):
+    def _lane_is_safe(self, side, obs):
         """True if the lane on `side` is usable and has room to enter."""
-        info = self._perceive_lane(side, loc)
+        info = obs["lane_left"] if side == 'left' else obs["lane_right"]
         if info is None or info["beside"]:
             return False
         for key, min_gap in (("ahead", LANE_CLEAR_AHEAD), ("behind", LANE_CLEAR_BEHIND)):
@@ -250,19 +303,19 @@ class PilotAgent:
                 return False
         return True
 
-    def _unstick_gate(self, loc, obs_dist):
+    def _unstick_gate(self, obs):
         if self._blocked_ticks < STALL_TICK_LIMIT:
             return None
-        red = self._perceive_traffic_light()
+        red = obs["light"]
         if red is not None and red <= 25.0:
             return None
         upcoming = self.route[self.target_index:self.target_index + 10]
         if any(opt != RoadOption.LANEFOLLOW for _, opt in upcoming):
             return None
-        if self._queue_beyond(loc, obs_dist):
+        if self._queue_beyond(obs["loc"], obs["obstacle"]):
             return None
         for side in ('left', 'right'):
-            if self._lane_is_safe(side, loc):
+            if self._lane_is_safe(side, obs):
                 return side
         return None
 
@@ -420,14 +473,6 @@ class PilotAgent:
 
         return {"beside": beside, "ahead": ahead, "behind": behind}
     
-    def _heading_error(self, loc, index, heading):
-        """Signed angle between vehicle heading and direction to route[index]."""
-        target = self.route[index][0].transform.location
-        # 2D steering; z ignored
-        desired = math.atan2(target.y - loc.y, target.x - loc.x)
-        # angles wrap at 180°: without this, a small left correction can read as a huge right turn
-        return (desired - heading + math.pi) % (2 * math.pi) - math.pi
-
     def _target_reached(self, loc):
         target_range = 3.0
         # target exists AND (within target range OR closer to next target than current)

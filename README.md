@@ -308,6 +308,23 @@ Refactor equivalence is therefore judged on state sequences, tick counts and
 metrics, with float diffs bounded by the measured same-code noise band
 (~0.15 on empty routes) - not byte equality.
 
+### Refactor: sense - assess - manoeuvre - control
+
+No behaviour change. run_step, grown to ~150 lines across four versions, split
+along the pipeline: _sense builds a per-tick perception snapshot and is the
+only caller of _perceive_* (one perception pass per tick; every decision reads
+the same world - the property a camera swap needs); _assess_hazards turns the
+snapshot into a longitudinal judgement {hold, brake, held}; _update_manoeuvre
+owns the state machine and all cross-tick manoeuvre memory, and may amend the
+hazard (PREPARING holds the brake); _lateral_control and _longitudinal_control
+are the unchanged maths. Made explicit in signatures rather than left implicit:
+hazard assessment reads last tick's manoeuvre state, and the machine writes
+back into the hazard - the two are coupled in both directions.
+
+Verified against pre-refactor traces on routes 2, 5 and 6: identical tick
+counts, identical state sequences, float diffs within the measured same-code
+noise band, identical metrics.
+
 ## Assumptions
 
 The agent currently assumes solved perception and localisation, and says so
