@@ -403,6 +403,42 @@ within a tick of 187.65s. Residual: _perceive_traffic_light's 25m range
 covers comfort engagement only up to ~32 km/h - a sensor-model conversion,
 pending.
 
+### v2.7 - de-magic II: closing-speed following
+
+The obstacle block converted: FOLLOW_GAP now applies only at standstill (a
+declared "see their tyres" convention, 2.5m bumper-to-bumper); the moving
+follow gap is a time headway (HEADWAY_S = 2.0s, the Highway Code two-second
+rule) - time scales from car park to motorway where fixed metres cannot.
+Engagement and latching follow v2.6's pattern.
+
+Two failures on the way, both caught by the benchmark before commit:
+
+1. Absolute-speed physics in traffic: carrying v^2/2d over from the light
+   stop treats every leader as a wall. A same-speed TM vehicle inside the
+   desired gap read as an emergency -> full brake in flowing traffic -> 32
+   rear-end collisions from following NPCs (route 6). Fixed by braking on
+   CLOSING SPEED: _perceive_obstacle now returns (gap, closing) - radar's
+   native pair, same convention as _perceive_lane - and a_req =
+   closing^2/2d stops the gap shrinking rather than the van. A stationary
+   blocker gives closing = our speed, so route 5 and light stops are
+   unchanged by construction.
+
+2. Latch release via the gap re-oscillated (route 5: 58 episodes): the
+   desired gap moves with our own speed, so braking "restored" it, released
+   the latch, sped up, re-latched. Release now keys only on evidence about
+   the leader - pulling away or gone - never on quantities our own braking
+   moves. The v2.6 light latch had this property by accident; now it is a
+   stated rule.
+
+Brake episodes: route 6 133 -> 9, route 5 33 -> 7, route 2 unchanged.
+Metrics clean throughout (0 collisions, 0 solids, 0 violations, 100%,
+sim times unchanged at 187.65s). Average speed did not rise - route timing
+is light-dominated; the gain is comfort and legibility, not pace.
+
+Remaining scale assumptions, next in line: lane-entry gates (8m/10m),
+reverse clearances, blend lengths, route-membership tolerances, perception
+ranges (25/30/40m).
+
 ## Assumptions
 
 The agent currently assumes solved perception and localisation, and says so

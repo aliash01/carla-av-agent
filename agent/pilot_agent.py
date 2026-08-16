@@ -15,16 +15,18 @@ STEERING_LOOKAHEAD = 2  # waypoints ahead for steering aim
 CURVE_LOOKAHEAD = 4     # route bend measured over target_index .. +4 (~8m)
 K = 0.15  # cross-track gain
 STEER_GAIN = math.pi / 6
-COAST_DECEL = 0.8   # LEGACY, obstacle block only - measured coast decel is actually
-                    # 0.10-0.26 m/s2 at benchmark speeds (coast-down calibration,
-                    # 2026-08-16); conversion of the obstacle block is the next unit
 MAX_DECEL = 6.0
 COMFORT_DECEL = 1.6 # declared preference: firmness of a normal, unhurried stop.
                     # Not invented from nothing - back-derived from four versions of
                     # validated behaviour: the old 20m light gate at benchmark top
                     # speed (7.94 m/s) implies engagement at 7.94^2/(2*20) ~= 1.6.
                     # Sweepable; the physics scales it to any speed.
-FOLLOW_GAP = 2.5  # metres kept clear behind a stopped obstacle
+FOLLOW_GAP = 2.5    # declared preference: bumper-to-bumper metres kept clear at
+                    # standstill ("see their tyres" convention); vehicle sizes are
+                    # already subtracted, so one convention covers car and truck
+HEADWAY_S = 2.0     # declared preference: moving follow gap in TIME (two-second
+                    # rule, Highway Code) - gap = HEADWAY_S * speed scales from
+                    # car park to motorway where fixed metres cannot
 SPEED_KP = 0.15
 
 STALL_TICK_LIMIT = 200      # 10s at 0.05s ticks: blocker considered parked
@@ -61,6 +63,7 @@ class PilotAgent:
         self.half_width = vehicle.bounding_box.extent.y    # centre-to-side, for the planner footprint
         self._last_obs = None   # previous tick's obstacle distance, for "gap opening?" checks
         self._stopping_for_light = False    # latched once a stop is committed; cleared on green
+        self._closing_on_obstacle = False   # latched while regulating the follow gap; cleared when restored
         self.map = world.get_map()
         self.state = Manoeuvre.FOLLOWING
         self.lane_offset = 0.0          # metres to shift our reference line sideways
@@ -134,10 +137,12 @@ class PilotAgent:
         Everything below reads the snapshot, never the sensors: one perception
         pass per tick, and every decision sees the same world."""
         loc = self.vehicle.get_location()
+        obstacle = self._perceive_obstacle()
         return {"loc": loc,
                 "speed": self.vehicle.get_velocity().length(),
                 "light": self._perceive_traffic_light(),
-                "obstacle": self._perceive_obstacle(),
+                "obstacle": obstacle[0] if obstacle is not None else None,
+                "obstacle_closing": obstacle[1] if obstacle is not None else None,
                 "lane_left": self._perceive_lane('left', loc),
                 "lane_right": self._perceive_lane('right', loc),
                 "rear": self._perceive_rear(loc),
@@ -178,20 +183,38 @@ class PilotAgent:
                     hazard["hold"] = True
                     hazard["brake"] = min(1.0, a_req / MAX_DECEL)
 
-        # vehicle ahead on our route: physics-brake to a gap SHORT of it
+        # vehicle ahead on our route: brake on CLOSING SPEED, not our speed -
+        # a_req is the decel that stops the gap shrinking just before the
+        # desired gap runs out. A same-speed leader inside the gap reads as
+        # closing 0 -> no brake (v^2/2d here treated it as a wall and slammed:
+        # 32 rear-end collisions from TM traffic). Desired gap is a time
+        # headway with a standstill floor. Latched (bare thresholds chatter,
+        # v2.6); released only on evidence about the LEADER - pulling away or
+        # gone - never on gap quantities our own braking moves.
         obs_dist = obs["obstacle"]
-        if obs_dist is not None:
-            gap_dist = obs_dist - FOLLOW_GAP
+        if obs_dist is None:
+            self._closing_on_obstacle = False
+        else:
+            closing = obs["obstacle_closing"]
+            desired_gap = max(FOLLOW_GAP, HEADWAY_S * speed)
+            gap_dist = obs_dist - desired_gap
             opening = self._last_obs is not None and obs_dist > self._last_obs + 0.05   # they're pulling away
-            held = gap_dist <= 0.5 or (speed < 0.5 and obs_dist < FOLLOW_GAP + 2 and not opening)
+            held = (obs_dist - FOLLOW_GAP) <= 0.5 or (speed < 0.5 and obs_dist < FOLLOW_GAP + 2 and not opening)
             hazard["held"] = held
             if held:
+                self._closing_on_obstacle = False             # pinned, not regulating
                 if self.state is not Manoeuvre.CHANGING:      # don't brake for the car we're passing
                     hazard["hold"] = True
                     hazard["brake"] = 1.0
             else:
-                a_req = speed * speed / (2 * max(gap_dist, 0.3))
-                if a_req >= COAST_DECEL and self.state is not Manoeuvre.CHANGING:
+                a_req = 0.0
+                if closing > 0:
+                    a_req = closing * closing / (2 * max(gap_dist, 0.3))
+                if a_req >= COMFORT_DECEL:
+                    self._closing_on_obstacle = True          # latch: regulate the approach
+                if opening:
+                    self._closing_on_obstacle = False         # leader pulling away: release
+                if self._closing_on_obstacle and self.state is not Manoeuvre.CHANGING:
                     hazard["hold"] = True
                     hazard["brake"] = max(hazard["brake"], min(1.0, a_req / MAX_DECEL))
         self._last_obs = obs_dist
@@ -476,13 +499,17 @@ class PilotAgent:
         return best
 
     def _perceive_obstacle(self):
-        """Ground-truth obstacle perception (CARLA actor query). Returns the
-        BUMPER-TO-BUMPER distance to the nearest vehicle on our upcoming route
-        within ~30m, else None. Contract stays fixed when replaced by
-        radar/lidar detection in the perception stage."""
+        """Ground-truth obstacle perception (CARLA actor query). Returns
+        (bumper-to-bumper distance, closing speed in m/s) for the nearest
+        vehicle on our upcoming route within ~30m, else None. closing > 0
+        means the gap is shrinking - same convention as _perceive_lane.
+        Radar's native measurement pair; contract stays fixed when replaced."""
         loc = self.vehicle.get_location()
         upcoming = [p[0].transform.location
                     for p in self.route[self.target_index:self.target_index + 15]]
+        f = self.vehicle.get_transform().get_forward_vector()
+        my_v = self.vehicle.get_velocity()
+        my_along = my_v.x * f.x + my_v.y * f.y
         best = None
         for actor in self.vehicle.get_world().get_actors().filter('vehicle.*'):
             if actor.id == self.vehicle.id:
@@ -496,8 +523,10 @@ class PilotAgent:
                 continue
             # centre-to-centre -> bumper-to-bumper: subtract both half-lengths
             d = max(0.0, d - self.half_length - actor.bounding_box.extent.x)
-            if best is None or d < best:
-                best = d
+            if best is None or d < best[0]:
+                ov = actor.get_velocity()
+                their_along = ov.x * f.x + ov.y * f.y   # their speed along OUR heading
+                best = (d, my_along - their_along)
         return best
 
     def _perceive_vehicles(self, loc):
