@@ -31,8 +31,6 @@ SPEED_KP = 0.15
 
 STALL_TICK_LIMIT = 200      # 10s at 0.05s ticks: blocker considered parked
 PREPARE_TICKS = 20          # 1s of confirmation before committing
-LANE_CLEAR_AHEAD = 8.0      # metres needed ahead in the target lane
-LANE_CLEAR_BEHIND = 10.0    # metres needed behind
 LANE_TTC_MIN = 3.0          # seconds; reject if someone arrives sooner
 
 TICK_S = 0.05                   # benchmark fixed delta; blends advance by speed * TICK_S
@@ -411,15 +409,25 @@ class PilotAgent:
         return throttle, hazard["brake"]
     
     def _lane_is_safe(self, side, obs):
-        """True if the lane on `side` is usable and has room to enter."""
+        """True if the lane on `side` is usable and has room to enter. The
+        required gaps are the v2.7 following rule applied from both seats:
+        ahead we become the follower (our headway at OUR speed), behind we
+        make THEM a follower (their headway at THEIR speed, reconstructed
+        from closing + ours) - entering must not force anyone into
+        tailgating. Standstill floor either way; TTC rejects fast arrivals."""
         info = obs["lane_left"] if side == 'left' else obs["lane_right"]
         if info is None or info["beside"]:
             return False
-        for key, min_gap in (("ahead", LANE_CLEAR_AHEAD), ("behind", LANE_CLEAR_BEHIND)):
-            hit = info[key]
+        speed = obs["speed"]
+        for key, hit in (("ahead", info["ahead"]), ("behind", info["behind"])):
             if hit is None:
                 continue
             gap, closing = hit
+            if key == "ahead":
+                min_gap = max(FOLLOW_GAP, HEADWAY_S * speed)
+            else:
+                their_speed = max(0.0, closing + speed)   # behind: closing = theirs - ours
+                min_gap = max(FOLLOW_GAP, HEADWAY_S * their_speed)
             if gap < min_gap:
                 return False
             if closing > 0.1 and gap / closing < LANE_TTC_MIN:   # arriving too soon

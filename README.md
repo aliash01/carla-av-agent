@@ -439,6 +439,28 @@ Remaining scale assumptions, next in line: lane-entry gates (8m/10m),
 reverse clearances, blend lengths, route-membership tolerances, perception
 ranges (25/30/40m).
 
+### v2.8 - de-magic III: lane-entry gates from both seats
+
+LANE_CLEAR_AHEAD (8m) and LANE_CLEAR_BEHIND (10m) - invented in v2.3 -
+replaced by the v2.7 following rule applied symmetrically: entering a lane
+makes us a follower of the car ahead (our headway at OUR speed, standstill
+floor) and makes the car behind a follower of us (their headway at THEIR
+speed, reconstructed as closing + ours from the existing lane contract).
+Entering must not force anyone into tailgating. The TTC >= 3s check was
+already time-based and stays.
+
+The new gates are more permissive at low speed (floor 2.5m vs 8/10m) and
+stricter against fast approachers (a 36 km/h closer needs 20m + TTC, where
+10m used to pass). Nothing on the current routes exercises the gates
+(route 5's adjacent lane is empty), so validation is ten synthetic
+gate tests (floors, both headway directions, TTC, beside-veto) plus
+benchmark invisibility: brake profiles identical to v2.7, metrics clean.
+
+Incidental finding: first equivalence comparison across a server restart -
+metrics reproduce within the same noise band as same-session repeats
+(route 2: 187.60s/9 inv vs 187.65s/8), so the light-phase reset makes
+reproducibility a property of the benchmark, not of a server session.
+
 ## Assumptions
 
 The agent currently assumes solved perception and localisation, and says so
