@@ -9,6 +9,7 @@ class Manoeuvre(Enum):
 
 import carla, math, os, csv
 from agents.navigation.local_planner import RoadOption
+from agent.planner import RefLine, plan as plan_manoeuvre_path
 
 STEERING_LOOKAHEAD = 2  # waypoints ahead for steering aim
 CURVE_LOOKAHEAD = 4     # route bend measured over target_index .. +4 (~8m)
@@ -25,9 +26,16 @@ LANE_CLEAR_AHEAD = 8.0      # metres needed ahead in the target lane
 LANE_CLEAR_BEHIND = 10.0    # metres needed behind
 LANE_TTC_MIN = 3.0          # seconds; reject if someone arrives sooner
 
+TICK_S = 0.05                   # benchmark fixed delta; blends advance by speed * TICK_S
+T_REJOIN_S = 1.8                # rejoin blend length grows with speed: L = speed * T_REJOIN_S
+REJOIN_FLOOR_M = 5.0            # minimum rejoin blend length
+REJOIN_CAP_M = 15.0             # maximum rejoin blend length
+
 REVERSE_MAX_M = 8.0             # never back up further than this
 REVERSE_THROTTLE = 0.6
-REVERSE_CLEAR_M = 6.0           # clearance from the blocker that makes a swing-out feasible
+REVERSE_CLEAR_M = 8.0           # clearance from the blocker that makes a swing-out feasible:
+                                # blend floor (4m) + the swept diagonal; 6m fails the
+                                # planner's collision check (validated offline)
 REAR_CLEAR_M = 10.0              # required clear space behind us before reversing
 
 class PilotAgent:
@@ -43,6 +51,7 @@ class PilotAgent:
                        for l in world.get_actors().filter('traffic.traffic_light*')
                        for wp in l.get_stop_waypoints()]
         self.half_length = vehicle.bounding_box.extent.x   # centre-to-bumper, for gap maths
+        self.half_width = vehicle.bounding_box.extent.y    # centre-to-side, for the planner footprint
         self._last_obs = None   # previous tick's obstacle distance, for "gap opening?" checks
         self.map = world.get_map()
         self.state = Manoeuvre.FOLLOWING
@@ -52,6 +61,14 @@ class PilotAgent:
         self._overtake_side = None
         self._blocker_loc = None
         self._reverse_start = None      # where reversing began, to cap distance backed
+        # planner execution state: the chosen blend and our progress through it
+        self._plan_target = None        # winning lateral offset, metres
+        self._plan_length = 1.0         # blend length of the winning candidate
+        self._plan_phase = 0.0          # 0..1 progress through the blend (by distance)
+        self._blend_from = 0.0          # offset the current blend started from
+        self._return_from = 0.0         # offset at the start of the rejoin blend
+        self._return_length = 1.0
+        self._return_phase = 0.0
 
         # opt-in control trace: one CSV row per tick, for before/after equivalence diffs
         self._trace = None
@@ -116,6 +133,7 @@ class PilotAgent:
                 "lane_left": self._perceive_lane('left', loc),
                 "lane_right": self._perceive_lane('right', loc),
                 "rear": self._perceive_rear(loc),
+                "vehicles": self._perceive_vehicles(loc),
                 "speed_limit": self._get_current_speed_limit()}
 
     def _assess_hazards(self, obs):
@@ -205,25 +223,86 @@ class PilotAgent:
                     ahead_m = (obs["obstacle"] or 0.0) + self.half_length + 2.4
                     self._blocker_loc = carla.Location(
                         x=loc.x + f0.x * ahead_m, y=loc.y + f0.y * ahead_m, z=loc.z)
+                    self._plan_target = None                  # fresh plan for a fresh manoeuvre
+                    self._plan_phase = 0.0
+                    self._blend_from = 0.0
                     self.state = Manoeuvre.CHANGING
 
         elif self.state is Manoeuvre.CHANGING:
-            self.lane_offset = -lane_w if self._overtake_side == 'left' else lane_w
-            past = False
-            if self._blocker_loc is not None:
-                fx = self.vehicle.get_transform().get_forward_vector()
-                along = fx.x * (self._blocker_loc.x - loc.x) + fx.y * (self._blocker_loc.y - loc.y)
-                past = along < -(self.half_length + 3.0)      # blocker's centre well behind our nose
-            if past:
-                self.state = Manoeuvre.RETURNING
+            # the planner picks the path; we execute its blend by distance travelled.
+            # No feasible candidate this tick: keep executing the last plan - the
+            # hazard layer still brakes independently if the world closes in.
+            result = self._plan_swing_out(obs, lane_w)
+            if result is not None:
+                target, length = result
+                if self._plan_target is None or abs(target - self._plan_target) > 1e-6:
+                    self._blend_from = self.lane_offset       # re-anchor: offset stays continuous
+                    self._plan_phase = 0.0
+                self._plan_target, self._plan_length = target, length
+            if self._plan_target is None:
+                self._blocked_ticks = 0                       # full stall period before retrying, not a hot loop
+                self.state = Manoeuvre.FOLLOWING              # never had a plan: stand down
+            else:
+                ds = obs["speed"] * TICK_S
+                self._plan_phase = min(1.0, self._plan_phase + ds / max(self._plan_length, 0.5))
+                self.lane_offset = (self._blend_from + (self._plan_target - self._blend_from)
+                                    * 0.5 * (1 - math.cos(math.pi * self._plan_phase)))
+                past = False
+                if self._blocker_loc is not None:
+                    fx = self.vehicle.get_transform().get_forward_vector()
+                    along = fx.x * (self._blocker_loc.x - loc.x) + fx.y * (self._blocker_loc.y - loc.y)
+                    past = along < -(self.half_length + 3.0)  # blocker's centre well behind our nose
+                if past:
+                    # rejoin blend: speed-driven length, unlike the old per-tick taper,
+                    # so the S covers the same road distance at any speed
+                    self._return_from = self.lane_offset
+                    self._return_phase = 0.0
+                    self._return_length = max(REJOIN_FLOOR_M,
+                                              min(obs["speed"] * T_REJOIN_S, REJOIN_CAP_M))
+                    self.state = Manoeuvre.RETURNING
 
         elif self.state is Manoeuvre.RETURNING:
-            self.lane_offset *= 0.9                           # taper back onto the route line
-            if abs(self.lane_offset) < 0.2:
+            ds = obs["speed"] * TICK_S
+            self._return_phase = min(1.0, self._return_phase + ds / max(self._return_length, 0.5))
+            self.lane_offset = self._return_from * 0.5 * (1 + math.cos(math.pi * self._return_phase))
+            if self._return_phase >= 1.0 or abs(self.lane_offset) < 0.05:
                 self.lane_offset = 0.0
                 self._blocked_ticks = 0
                 self._blocker_loc = None
+                self._plan_target = None
                 self.state = Manoeuvre.FOLLOWING
+
+    def _plan_swing_out(self, obs, lane_w):
+        """Build planner inputs from the snapshot: route ahead as the reference
+        line, candidate targets gated by lane legality, all nearby vehicles as
+        obstacles. Returns (target_offset, blend_length) or None."""
+        # anchor the reference line at the VAN, not at the next waypoint: after
+        # reversing, the waypoint sits up at the blocker, so a waypoint-anchored
+        # sweep starts inside the collision and every candidate dies. Project
+        # our position onto the route line (undo the commanded offset), then
+        # append only route points genuinely ahead of us.
+        loc = obs["loc"]
+        f = self.vehicle.get_transform().get_forward_vector()
+        A = self.route[self.target_index][0].transform.get_forward_vector()
+        pts = [(loc.x + A.y * self.lane_offset, loc.y - A.x * self.lane_offset)]
+        for p in self.route[self.target_index:self.target_index + 20]:
+            l = p[0].transform.location
+            if f.x * (l.x - loc.x) + f.y * (l.y - loc.y) > 1.0:
+                pts.append((l.x, l.y))
+        if len(pts) < 2:
+            return None
+        # candidates are lane centres, not arbitrary metres: stay on line, or
+        # move to a legal neighbouring lane. No straddle options - the offset
+        # penalty would make the planner prefer them whenever they fit, and
+        # habitual lane-straddling is exactly what the benchmark penalises.
+        targets = [0.0]
+        if obs["lane_left"] is not None:
+            targets.append(-lane_w)
+        if obs["lane_right"] is not None:
+            targets.append(lane_w)
+        return plan_manoeuvre_path(RefLine(pts), self.lane_offset, obs["speed"],
+                                   (self.half_length, self.half_width),
+                                   obs["vehicles"], targets, self._plan_target)
 
     def _advance_route(self, loc):
         """Ratchet target_index past reached waypoints; True when the route is done."""
@@ -399,6 +478,25 @@ class PilotAgent:
             if best is None or d < best:
                 best = d
         return best
+
+    def _perceive_vehicles(self, loc):
+        """Ground-truth surround perception (CARLA actor query): every vehicle
+        within 40m as an oriented box, for the planner's collision check.
+        Returns [{x, y, yaw, half_length, half_width}]. Contract stays fixed
+        when replaced by lidar/camera detection in the perception stage."""
+        out = []
+        for actor in self.vehicle.get_world().get_actors().filter('vehicle.*'):
+            if actor.id == self.vehicle.id:
+                continue
+            other_loc = actor.get_location()
+            if other_loc.distance(loc) > 40.0:
+                continue
+            tf = actor.get_transform()
+            out.append({"x": other_loc.x, "y": other_loc.y,
+                        "yaw": math.radians(tf.rotation.yaw),
+                        "half_length": actor.bounding_box.extent.x,
+                        "half_width": actor.bounding_box.extent.y})
+        return out
 
     def _get_current_speed_limit(self):
         return self.vehicle.get_speed_limit() # for now use CARLA system for grabbing speed limit, in future may be changed to suit more realistic scenario
