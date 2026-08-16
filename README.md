@@ -325,6 +325,48 @@ Verified against pre-refactor traces on routes 2, 5 and 6: identical tick
 counts, identical state sequences, float diffs within the measured same-code
 noise band, identical metrics.
 
+### v2.5 - sampling-based local planner (manoeuvre execution)
+
+The revisit of the deleted local-planner branch, with the two pieces it died
+without: candidates are legality-gated through _perceive_lane at generation,
+and the planner only runs once the v2.4 gate has already committed to a
+manoeuvre - patience stays the state machine's job. The planner (agent/
+planner.py, pure 2D geometry, no CARLA imports, testable offline) generates
+raised-cosine offset blends along the route line, sweeps an N-circle footprint
+cover along each, discards colliders, and scores survivors: offset penalty
+(smallest deviation wins), bend penalty, hysteresis discount against
+tick-to-tick chatter. Candidates are lane centres, not arbitrary metres -
+straddle options were tried and removed, since the offset penalty makes the
+planner prefer them whenever they fit, and habitual lane-straddling is exactly
+what the benchmark penalises. Output stays a lane_offset; the controller is
+untouched. New perception contract: _perceive_vehicles(), nearby vehicles as
+oriented boxes. The rejoin is now a speed-scaled S (distance-based) rather
+than the old per-tick 0.9 taper - a time-based decay that covered more road
+at higher speed by accident.
+
+Route 5: completes identically (187.65s, 0 collisions, 0 solids), lane
+invasions unchanged (15-17 across runs, both versions), max steering during
+the manoeuvre 0.61 vs 1.00 - v2.4 saturated the wheel the tick it committed;
+the planned blend never does. Routes 2 and 6: trace-equivalent to baseline
+(planner provably inactive off-manoeuvre).
+
+Found by measurement, not foresight: a 2-circle footprint cover carries ~1.5m
+of phantom width against 1.6m of true clearance and vetoed a legal pass -
+raised to 3 circles (~0.9m). The 6m reverse clearance that v2.4 "passed" with
+was never actually checked; a collision-checked swing-out needs 8m
+(REVERSE_CLEAR_M raised, validated offline). If no candidate survives, the
+agent stands down and waits a full stall period - the frozen-robot failure is
+accepted and recorded rather than papered over with margin hacks.
+
+Limits: the rejoin blend is not collision-checked (the queue check and
+past-blocker check protect it today); obstacles are swept where they are -
+no motion prediction, correct for parked blockers only; blend execution is
+open-loop (no feedback if the controller lags the profile); candidates come
+from immediate neighbour lanes only. Planner constants (blend durations,
+scoring weights, margins) are declared first guesses - the next unit converts
+scale-assuming values (fixed metres and durations) to generalisable
+references: lane widths, footprints, time headways and v²/2a physics.
+
 ## Assumptions
 
 The agent currently assumes solved perception and localisation, and says so
