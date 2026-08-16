@@ -15,8 +15,15 @@ STEERING_LOOKAHEAD = 2  # waypoints ahead for steering aim
 CURVE_LOOKAHEAD = 4     # route bend measured over target_index .. +4 (~8m)
 K = 0.15  # cross-track gain
 STEER_GAIN = math.pi / 6
-COAST_DECEL = 0.8 
+COAST_DECEL = 0.8   # LEGACY, obstacle block only - measured coast decel is actually
+                    # 0.10-0.26 m/s2 at benchmark speeds (coast-down calibration,
+                    # 2026-08-16); conversion of the obstacle block is the next unit
 MAX_DECEL = 6.0
+COMFORT_DECEL = 1.6 # declared preference: firmness of a normal, unhurried stop.
+                    # Not invented from nothing - back-derived from four versions of
+                    # validated behaviour: the old 20m light gate at benchmark top
+                    # speed (7.94 m/s) implies engagement at 7.94^2/(2*20) ~= 1.6.
+                    # Sweepable; the physics scales it to any speed.
 FOLLOW_GAP = 2.5  # metres kept clear behind a stopped obstacle
 SPEED_KP = 0.15
 
@@ -53,6 +60,7 @@ class PilotAgent:
         self.half_length = vehicle.bounding_box.extent.x   # centre-to-bumper, for gap maths
         self.half_width = vehicle.bounding_box.extent.y    # centre-to-side, for the planner footprint
         self._last_obs = None   # previous tick's obstacle distance, for "gap opening?" checks
+        self._stopping_for_light = False    # latched once a stop is committed; cleared on green
         self.map = world.get_map()
         self.state = Manoeuvre.FOLLOWING
         self.lane_offset = 0.0          # metres to shift our reference line sideways
@@ -146,15 +154,28 @@ class PilotAgent:
                   "held": False}   # pinned behind an obstacle this tick (manoeuvre machine counts these)
         speed = obs["speed"]
 
-        # red light: physics-brake to the stop line, hold until green
+        # red light: engage when the decel needed to stop AT the line reaches a
+        # comfortable braking level - speed-correct at any speed, unlike the old
+        # fixed 20m gate (which encoded ~1.6 m/s2 at town speed and nothing else).
+        # Once stopped, hold until the light stops reporting red: a_req is 0 at
+        # standstill, so physics alone would release the hold and run the light.
         red_dist = obs["light"]
-        if red_dist is not None and red_dist <= 20:
-            hazard["hold"] = True
+        if red_dist is None:
+            self._stopping_for_light = False      # green or behind us: commitment ends
+        else:
             if speed < 0.5 or (red_dist < 2.0 and speed < 2.0):
-                hazard["brake"] = 1.0     # stopped, or nearly there: finish the stop and hold until green
+                hazard["hold"] = True     # stopped at (or crawling onto) the line
+                hazard["brake"] = 1.0     # finish the stop and hold until green
             else:
                 a_req = speed * speed / (2 * max(red_dist, 0.3))   # decel to stop AT the line
-                if a_req >= COAST_DECEL:
+                if a_req >= COMFORT_DECEL:
+                    self._stopping_for_light = True    # latch: the stop is committed
+                if self._stopping_for_light:
+                    # brake keeps tracking a_req even when it dips back under the
+                    # engagement level - the dip means the stop is working, not
+                    # that it should be cancelled (unlatched, this chattered:
+                    # brake episodes doubled)
+                    hazard["hold"] = True
                     hazard["brake"] = min(1.0, a_req / MAX_DECEL)
 
         # vehicle ahead on our route: physics-brake to a gap SHORT of it

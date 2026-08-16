@@ -367,6 +367,42 @@ scoring weights, margins) are declared first guesses - the next unit converts
 scale-assuming values (fixed metres and durations) to generalisable
 references: lane widths, footprints, time headways and v²/2a physics.
 
+### v2.6 - de-magic I: physics-derived light response
+
+First of a series converting scale assumptions (fixed metres, guessed rates)
+into generalisable references: map geometry, vehicle calibration, physics.
+
+Coast-down calibration: the Sprinter's engine-off deceleration was measured
+(throttle to top speed, release, record per-tick decel, samples gated on
+near-zero steering): 0.10-0.26 m/s2 across 13-23 km/h, rising with speed.
+COAST_DECEL = 0.8 was therefore wrong by 4-8x - the agent's "coast
+preference" was largely fictional; the brake was doing almost all the work.
+True coast-to-stop from 25 km/h would need ~120m, so coast-first is bounded
+by a comfort-braking tier.
+
+Light response: the 20m engagement gate is gone. The van now engages when
+the deceleration needed to stop at the line (v^2/2d) reaches COMFORT_DECEL -
+correct at any speed, where the fixed gate assumed town speeds. COMFORT_DECEL
+= 1.6 m/s2 is a declared, sweepable preference, back-derived from the old
+gate's own behaviour at benchmark top speed (7.94^2/(2*20) ~= 1.6), so
+benchmark behaviour is preserved by construction. Stopped-at-line holding is
+its own explicit condition (a_req = 0 at standstill would otherwise release
+the hold and run the light), cleared when the light stops reporting red.
+
+Finding - thresholds chatter without memory: the bare physics threshold
+doubled brake episodes (route 2: 23 -> 55); braking lowers a_req below the
+threshold, releasing the brake, which raises a_req again. Same failure the
+planner's hysteresis prevents laterally. Fixed by latching the committed
+stop until the light clears: 6 episodes - one committed stop per red -
+against 23 under the old gate, which had its own mild flicker. Route 6's
+episode count is unchanged (164): its braking is obstacle-following, the
+unconverted block, which is the next conversion.
+
+Metrics unchanged throughout: 0 violations, 0 collisions, 100%, sim times
+within a tick of 187.65s. Residual: _perceive_traffic_light's 25m range
+covers comfort engagement only up to ~32 km/h - a sensor-model conversion,
+pending.
+
 ## Assumptions
 
 The agent currently assumes solved perception and localisation, and says so
