@@ -9,7 +9,8 @@ class Manoeuvre(Enum):
 
 import carla, math, os, csv
 from agents.navigation.local_planner import RoadOption
-from agent.planner import RefLine, plan as plan_manoeuvre_path
+from agent.planner import (RefLine, plan as plan_manoeuvre_path, min_blend_length,
+                           min_clearance, shape, EXEC_LAG, TAIL)
 
 STEERING_LOOKAHEAD = 2  # waypoints ahead for steering aim
 CURVE_LOOKAHEAD = 4     # route bend measured over target_index .. +4 (~8m)
@@ -29,21 +30,23 @@ HEADWAY_S = 2.0     # declared preference: moving follow gap in TIME (two-second
                     # car park to motorway where fixed metres cannot
 SPEED_KP = 0.15
 
+STOPPED_MS = 0.1            # one definition of "stopped": the stall counter and the
+                            # follow latch must agree, or the van can be stopped for
+                            # one and moving for the other
 STALL_TICK_LIMIT = 200      # 10s at 0.05s ticks: blocker considered parked
 PREPARE_TICKS = 20          # 1s of confirmation before committing
 LANE_TTC_MIN = 3.0          # seconds; reject if someone arrives sooner
 
 TICK_S = 0.05                   # benchmark fixed delta; blends advance by speed * TICK_S
 T_REJOIN_S = 1.8                # rejoin blend length grows with speed: L = speed * T_REJOIN_S
-REJOIN_FLOOR_M = 5.0            # minimum rejoin blend length
 REJOIN_CAP_M = 15.0             # maximum rejoin blend length
+R_TURN = 2.58                   # measured full-lock turning radius (calibration run,
+                                # 2026-08-16: crawl speed, steer 1.0, circle fit,
+                                # spread 0.41m). CARLA's 70-degree lock is generous
+                                # against a real Sprinter's ~7m - but it is this
+                                # van's truth, measured through the control channel
 
-REVERSE_MAX_M = 8.0             # never back up further than this
 REVERSE_THROTTLE = 0.6
-REVERSE_CLEAR_M = 8.0           # clearance from the blocker that makes a swing-out feasible:
-                                # blend floor (4m) + the swept diagonal; 6m fails the
-                                # planner's collision check (validated offline)
-REAR_CLEAR_M = 10.0              # required clear space behind us before reversing
 
 class PilotAgent:
     def __init__(self, vehicle, destination, grp, trace_path=None):
@@ -68,8 +71,7 @@ class PilotAgent:
         self._blocked_ticks = 0
         self._prepare_ticks = 0
         self._overtake_side = None
-        self._blocker_loc = None
-        self._reverse_start = None      # where reversing began, to cap distance backed
+        self._blocker_box = None        # the blocker's real oriented box
         # planner execution state: the chosen blend and our progress through it
         self._plan_target = None        # winning lateral offset, metres
         self._plan_length = 1.0         # blend length of the winning candidate
@@ -78,6 +80,12 @@ class PilotAgent:
         self._return_from = 0.0         # offset at the start of the rejoin blend
         self._return_length = 1.0
         self._return_phase = 0.0
+        self._noprogress_ticks = 0      # commanded to proceed but not moving
+        self._clearance = None          # measured gap to the nearest vehicle,
+                                        # trace only (see min_clearance)
+        self._cross = 0.0             # last tick's achieved offset from the route line,
+                                        # for the trace: (cross - lane_offset) is the
+                                        # execution error MARGIN has to absorb
 
         # opt-in control trace: one CSV row per tick, for before/after equivalence diffs
         self._trace = None
@@ -87,7 +95,8 @@ class PilotAgent:
             self._trace = open(trace_path, 'w', newline='')
             self._trace_writer = csv.writer(self._trace)
             self._trace_writer.writerow(
-                ['tick', 'throttle', 'steer', 'brake', 'reverse', 'state', 'lane_offset'])
+                ['tick', 'throttle', 'steer', 'brake', 'reverse', 'state', 'lane_offset',
+                 'cross', 'track_err', 'speed', 'clearance'])
 
     def run_step(self):
         """Thin wrapper: compute the control, optionally trace it, return it unchanged."""
@@ -97,7 +106,10 @@ class PilotAgent:
             self._trace_writer.writerow(
                 [self._trace_tick, repr(control.throttle), repr(control.steer),
                  repr(control.brake), int(control.reverse),
-                 self.state.name, repr(self.lane_offset)])
+                 self.state.name, repr(self.lane_offset),
+                 repr(self._cross), repr(self._cross - self.lane_offset),
+                 repr(self.vehicle.get_velocity().length()),
+                 '' if self._clearance is None else repr(self._clearance)])
             self._trace.flush()
         self._trace_tick += 1
         return control
@@ -109,13 +121,30 @@ class PilotAgent:
         obs = self._sense()
         hazard = self._assess_hazards(obs)
 
-        # reversing has its own control path (rear target, inverted kinematics)
+        if self._trace is not None:
+            # instrumentation only: how close we ACTUALLY came, in the same
+            # geometry the planner's sweep uses, so planned and achieved
+            # clearance are directly comparable
+            tf = self.vehicle.get_transform()
+            self._clearance = min_clearance(
+                tf.location.x, tf.location.y, math.radians(tf.rotation.yaw),
+                (self.half_length, self.half_width), obs["vehicles"])
+
+        # reversing has its own control path (rear target, inverted kinematics).
+        # Exit is feasibility-driven: back up only until the planner says a
+        # swing-out exists (asked each tick), not to a stored clearance. Once
+        # the gap exceeds the planner's own sweep horizon, more backing cannot
+        # change its answer - that is the cap. Abort if the car behind is at
+        # our standstill gap.
         if self.state is Manoeuvre.REVERSING:
             loc = obs["loc"]
-            backed = self._reverse_start.distance(loc) if self._reverse_start is not None else 0.0
-            enough_room = obs["obstacle"] is None or obs["obstacle"] >= REVERSE_CLEAR_M
-            if (enough_room or backed >= REVERSE_MAX_M
-                    or (obs["rear"] is not None and obs["rear"] < 3.0)):
+            wp_here = self.map.get_waypoint(loc)
+            lane_w = wp_here.lane_width if wp_here else 3.5
+            feasible = self._swing_out_feasible(obs, lane_w)
+            beyond_horizon = (obs["obstacle"] is None
+                              or obs["obstacle"] >= min_blend_length(lane_w, R_TURN) + TAIL)
+            if (feasible or beyond_horizon
+                    or (obs["rear"] is not None and obs["rear"] < FOLLOW_GAP)):
                 self.state = Manoeuvre.PREPARING
                 self._prepare_ticks = 0
                 return carla.VehicleControl(brake=1.0)        # settle before swinging out
@@ -212,6 +241,16 @@ class PilotAgent:
                     self._closing_on_obstacle = True          # latch: regulate the approach
                 if opening:
                     self._closing_on_obstacle = False         # leader pulling away: release
+                if speed < STOPPED_MS:
+                    # at rest there is no approach left to regulate. Holding the
+                    # latch here deadlocks: closing is 0 so brake is 0, but hold
+                    # still pins the throttle off, and a van that cannot move can
+                    # never observe the leader pulling away - the only other
+                    # release. Measured: 4717 ticks (236s) frozen on route 5,
+                    # throttle 0, brake 0, beyond the pinned window. Releasing
+                    # lets it close up and become properly pinned, which is also
+                    # what makes _blocked_ticks run and the unstick gate reachable.
+                    self._closing_on_obstacle = False
                 if self._closing_on_obstacle and self.state is not Manoeuvre.CHANGING:
                     hazard["hold"] = True
                     hazard["brake"] = max(hazard["brake"], min(1.0, a_req / MAX_DECEL))
@@ -227,10 +266,31 @@ class PilotAgent:
         if obs["obstacle"] is None:
             self._blocked_ticks = 0
         elif hazard["held"]:
-            if obs["speed"] < 0.1:
+            if obs["speed"] < STOPPED_MS:
                 self._blocked_ticks += 1                      # accruing stall time
         else:
             self._blocked_ticks = 0
+
+        # wedged mid-manoeuvre: told to proceed, and not proceeding. The blends
+        # advance by DISTANCE travelled, so a van that cannot move never finishes
+        # the manoeuvre and sits there at full throttle - measured: 149.7s in
+        # RETURNING, throttle 1.0, grinding (3008 contacts). Nothing holding us
+        # plus no movement is the signature; a legitimate stop (light, leader)
+        # sets hazard["hold"] and resets the count. Reuses the blocker patience
+        # budget rather than inventing a second one.
+        if (self.state in (Manoeuvre.CHANGING, Manoeuvre.RETURNING)
+                and not hazard["hold"] and obs["speed"] < STOPPED_MS):
+            self._noprogress_ticks += 1
+        else:
+            self._noprogress_ticks = 0
+        if self._noprogress_ticks >= STALL_TICK_LIMIT:
+            self._noprogress_ticks = 0
+            self.lane_offset = 0.0          # abandon the deviation; the cross-track
+            self._plan_target = None        # term recovers the lane from wherever we are
+            self._blocker_box = None
+            self._blocked_ticks = 0         # full patience period before retrying
+            self.state = Manoeuvre.FOLLOWING
+            return
 
         loc = obs["loc"]
         wp_here = self.map.get_waypoint(loc)
@@ -242,14 +302,14 @@ class PilotAgent:
             if side is not None:
                 self._overtake_side = side
                 self._prepare_ticks = 0
-                if obs["obstacle"] < REVERSE_CLEAR_M:
-                    if obs["rear"] is None or obs["rear"] >= REAR_CLEAR_M:
-                        self._reverse_start = loc
-                        self.state = Manoeuvre.REVERSING      # too close to swing out: back up first
-                    else:
-                        self.state = Manoeuvre.PREPARING      # nowhere to reverse: try anyway
-                else:
+                # ask the planner whether a swing-out exists from here, rather
+                # than predicting with a stored clearance (the late REVERSE_CLEAR_M)
+                if self._swing_out_feasible(obs, lane_w):
                     self.state = Manoeuvre.PREPARING
+                elif obs["rear"] is None or obs["rear"] > FOLLOW_GAP:
+                    self.state = Manoeuvre.REVERSING          # infeasible: back up to make room
+                else:
+                    self.state = Manoeuvre.PREPARING          # nowhere to reverse: try anyway
 
         elif self.state is Manoeuvre.PREPARING:
             self.lane_offset = 0.0
@@ -260,11 +320,11 @@ class PilotAgent:
                 hazard["hold"] = True                         # stay put: don't creep back onto the bumper
                 hazard["brake"] = 1.0
                 if self._prepare_ticks >= PREPARE_TICKS:
-                    # remember where the blocker is, so we know when we're past it
-                    f0 = self.vehicle.get_transform().get_forward_vector()
-                    ahead_m = (obs["obstacle"] or 0.0) + self.half_length + 2.4
-                    self._blocker_loc = carla.Location(
-                        x=loc.x + f0.x * ahead_m, y=loc.y + f0.y * ahead_m, z=loc.z)
+                    # keep the blocker's REAL box, not a point estimated from the gap
+                    # plus a guessed half-length. Perception already returns true
+                    # extents for every vehicle; the old estimate assumed 2.4m and
+                    # cut back in early whenever the car was longer than that.
+                    self._blocker_box = self._nearest_blocker(obs)
                     self._plan_target = None                  # fresh plan for a fresh manoeuvre
                     self._plan_phase = 0.0
                     self._blend_from = 0.0
@@ -288,31 +348,103 @@ class PilotAgent:
                 ds = obs["speed"] * TICK_S
                 self._plan_phase = min(1.0, self._plan_phase + ds / max(self._plan_length, 0.5))
                 self.lane_offset = (self._blend_from + (self._plan_target - self._blend_from)
-                                    * 0.5 * (1 - math.cos(math.pi * self._plan_phase)))
+                                    * shape(self._plan_phase))
+                # past it when its own rear extent is behind our rear bumper, measured
+                # from its real box projected onto our heading - no guessed margin
+                # RUNTIME PLAN CHECK. The sweep certified the LAG-STRETCHED path,
+                # not the commanded one, so that stretched path is the promise the
+                # clearance rests on. Falling behind it means the certified clearance
+                # no longer bounds us, and driving deeper into the pass is unvalidated.
+                # Response is to stop accelerating, which is genuinely corrective here:
+                # the lateral controller acts per metre travelled, so less speed buys
+                # more sideways movement per metre and the van catches its plan up.
+                # Needs no tolerance of its own - EXEC_LAG defines it - and cannot
+                # deadlock, because the hold lifts once the van is stopped.
+                if obs["speed"] > STOPPED_MS and self._behind_plan():
+                    hazard["hold"] = True
+
                 past = False
-                if self._blocker_loc is not None:
+                if self._blocker_box is not None:
+                    b = self._blocker_box
                     fx = self.vehicle.get_transform().get_forward_vector()
-                    along = fx.x * (self._blocker_loc.x - loc.x) + fx.y * (self._blocker_loc.y - loc.y)
-                    past = along < -(self.half_length + 3.0)  # blocker's centre well behind our nose
-                if past:
+                    along = fx.x * (b["x"] - loc.x) + fx.y * (b["y"] - loc.y)
+                    d_yaw = b["yaw"] - math.atan2(fx.y, fx.x)
+                    reach = (abs(math.cos(d_yaw)) * b["half_length"]
+                             + abs(math.sin(d_yaw)) * b["half_width"])
+                    past = along < -(self.half_length + reach)
+                # and only rejoin once the planner agrees the way back is clear. The
+                # swing-out was swept; the rejoin never was, which is where the van
+                # cut into the blocker (measured overlap -1.12m, worst AFTER the
+                # manoeuvre had "finished").
+                if past and self._return_is_clear(obs, lane_w):
                     # rejoin blend: speed-driven length, unlike the old per-tick taper,
                     # so the S covers the same road distance at any speed
                     self._return_from = self.lane_offset
                     self._return_phase = 0.0
-                    self._return_length = max(REJOIN_FLOOR_M,
+                    self._return_length = max(min_blend_length(self.lane_offset, R_TURN),
                                               min(obs["speed"] * T_REJOIN_S, REJOIN_CAP_M))
                     self.state = Manoeuvre.RETURNING
 
         elif self.state is Manoeuvre.RETURNING:
             ds = obs["speed"] * TICK_S
             self._return_phase = min(1.0, self._return_phase + ds / max(self._return_length, 0.5))
-            self.lane_offset = self._return_from * 0.5 * (1 + math.cos(math.pi * self._return_phase))
+            self.lane_offset = self._return_from * (1.0 - shape(self._return_phase))
             if self._return_phase >= 1.0 or abs(self.lane_offset) < 0.05:
                 self.lane_offset = 0.0
                 self._blocked_ticks = 0
-                self._blocker_loc = None
+                self._blocker_box = None
                 self._plan_target = None
                 self.state = Manoeuvre.FOLLOWING
+
+    def _behind_plan(self):
+        """Is the van further behind its commanded offset than the plan allowed for?
+
+        The collision sweep passes a blend stretched by EXEC_LAG, so the promise
+        that clearance rests on is the stretched path - being behind THAT is the
+        condition that invalidates it, not merely being behind the command (which
+        is expected and already accounted for). Uses last tick's achieved offset,
+        since _lateral_control runs after this."""
+        if self.state is not Manoeuvre.CHANGING or self._plan_target is None:
+            return False
+        promised = (self._blend_from + (self._plan_target - self._blend_from)
+                   * shape(self._plan_phase / EXEC_LAG))
+        toward = 1.0 if self._plan_target >= self._blend_from else -1.0
+        return (promised - self._cross) * toward > 0.0
+
+    def _nearest_blocker(self, obs):
+        """The real oriented box of the vehicle we are stuck behind, from perception
+        rather than estimated from a gap. Nearest vehicle ahead of us on our own
+        route - route membership is the same filter used everywhere else, and it
+        keeps a car on a crossing road from being mistaken for our blocker."""
+        loc = obs["loc"]
+        f = self.vehicle.get_transform().get_forward_vector()
+        upcoming = [p[0].transform.location
+                    for p in self.route[self.target_index:self.target_index + 15]]
+        best, best_along = None, None
+        for v in obs["vehicles"]:
+            along = f.x * (v["x"] - loc.x) + f.y * (v["y"] - loc.y)
+            if along <= 0.0:
+                continue                            # behind us
+            if not any(math.hypot(v["x"] - p.x, v["y"] - p.y) < 3.0 for p in upcoming):
+                continue                            # not on our route
+            if best_along is None or along < best_along:
+                best, best_along = v, along
+        return best
+
+    def _return_is_clear(self, obs, lane_w):
+        """Whether the planner would choose the lane centre from here - i.e. a blend
+        back to offset 0 survives its own collision sweep. Reuses plan() rather than
+        adding a second check: the offset cost already prefers 0 whenever it fits, so
+        the planner picking anything else means the way back is not clear yet."""
+        result = self._plan_swing_out(obs, lane_w)
+        return result is not None and abs(result[0]) < 1e-6
+
+    def _swing_out_feasible(self, obs, lane_w):
+        """Ask the planner whether a collision-free swing-out exists from the
+        current position: a surviving candidate with a non-zero offset (offset
+        0 is the blocked lane we are stuck in)."""
+        result = self._plan_swing_out(obs, lane_w)
+        return result is not None and abs(result[0]) > 1e-6
 
     def _plan_swing_out(self, obs, lane_w):
         """Build planner inputs from the snapshot: route ahead as the reference
@@ -344,7 +476,7 @@ class PilotAgent:
             targets.append(lane_w)
         return plan_manoeuvre_path(RefLine(pts), self.lane_offset, obs["speed"],
                                    (self.half_length, self.half_width),
-                                   obs["vehicles"], targets, self._plan_target)
+                                   obs["vehicles"], targets, self._plan_target, R_TURN)
 
     def _advance_route(self, loc):
         """Ratchet target_index past reached waypoints; True when the route is done."""
@@ -354,12 +486,35 @@ class PilotAgent:
                 return True
         return False
 
+    def _offset_ahead(self, d):
+        """The commanded lateral offset d metres further along the path, not here.
+
+        The aim point lies ahead of us, so shifting it by the offset we should have
+        NOW under-shifts it by however much the blend grows over that distance: the
+        van steers for a fraction of the shift, finds itself pointing correctly, and
+        levels out. Measured: commanded 0.55m while the blend was already 2.9m over
+        at the aim point, so the van drifted right and then went straight into the
+        blocker. Same failure as the original unshifted aim point, one layer along.
+
+        Blends advance by distance travelled, so 'd metres ahead' is just d/length
+        of extra phase. Returns lane_offset unchanged when not manoeuvring, so
+        ordinary lane-following is bit-identical to before."""
+        if self.state is Manoeuvre.CHANGING and self._plan_target is not None:
+            phase = min(1.0, self._plan_phase + d / max(self._plan_length, 0.5))
+            return (self._blend_from + (self._plan_target - self._blend_from)
+                    * shape(phase))
+        if self.state is Manoeuvre.RETURNING:
+            phase = min(1.0, self._return_phase + d / max(self._return_length, 0.5))
+            return self._return_from * (1.0 - shape(phase))
+        return self.lane_offset
+
     def _lateral_control(self, obs):
-        """Steering: aim at a waypoint ahead, shifted sideways by lane_offset during
-        a manoeuvre so the heading term pulls the same way as the cross-track term
-        instead of fighting it, plus a cross-track correction against the (equally
-        shifted) route line. Returns (steer, heading_error) - the error also feeds
-        longitudinal control, which slows for how sharply we're turning."""
+        """Steering: aim at a waypoint ahead, shifted sideways by the offset the
+        blend calls for AT THAT POINT (not the offset here - see _offset_ahead),
+        so the heading term pulls the same way as the cross-track term instead of
+        levelling out early, plus a cross-track correction against the route line
+        shifted by our present offset. Returns (steer, heading_error) - the error
+        also feeds longitudinal control, which slows for how sharply we're turning."""
         loc = obs["loc"]
         f = self.vehicle.get_transform().get_forward_vector()
         heading = math.atan2(f.y, f.x)
@@ -367,9 +522,10 @@ class PilotAgent:
         aim_index = min(self.target_index + STEERING_LOOKAHEAD, len(self.route) - 1)
         wp_aim = self.route[aim_index][0].transform
         A_aim = wp_aim.get_forward_vector()
+        aim_offset = self._offset_ahead(loc.distance(wp_aim.location))
         aim_loc = carla.Location(
-            x=wp_aim.location.x - A_aim.y * self.lane_offset,
-            y=wp_aim.location.y + A_aim.x * self.lane_offset,
+            x=wp_aim.location.x - A_aim.y * aim_offset,
+            y=wp_aim.location.y + A_aim.x * aim_offset,
             z=wp_aim.location.z)
         desired = math.atan2(aim_loc.y - loc.y, aim_loc.x - loc.x)
         # angles wrap at 180 degrees: without this, a small left correction can read as a huge right turn
@@ -382,7 +538,14 @@ class PilotAgent:
         Bx = loc.x - wp_tf.location.x
         By = loc.y - wp_tf.location.y
         cross = A.x * By - A.y * Bx
+        self._cross = cross     # recorded for the trace, not used by the controller
 
+        # NOT a candidate for a distance-derived gain: scaling K by the room left in
+        # the blend (k = 2*R_TURN/L_remaining^2) was tried and is much worse. As the
+        # blend closes, L -> 0 and the gain grows without bound, so any small error
+        # saturates: 245 of 288 manoeuvre ticks at full lock, van dragged 4.9m off
+        # the route line, route 5 timed out at 12% with 211 contacts. The term stops
+        # being a correction and becomes bang-bang. The swept K stands.
         steer = max(-1.0, min(1.0, error / (STEER_GAIN) - K * (cross - self.lane_offset)))
         return steer, error
 

@@ -156,6 +156,15 @@ if __name__ == '__main__':
         grp = GlobalRoutePlanner(world.get_map(), 2.0)
         return PilotAgent(vehicle, destination, grp)
 
+    def traced_pilot_factory(name):
+        """Same agent, writing a per-tick control+tracking trace. Used to measure
+        execution error (commanded vs achieved lane offset), not for scoring."""
+        def factory(vehicle, destination):
+            grp = GlobalRoutePlanner(world.get_map(), 2.0)
+            return PilotAgent(vehicle, destination, grp,
+                              trace_path=f'results/traces/{name}.csv')
+        return factory
+
     def behavior_agent_factory(vehicle, destination):
         agent = BehaviorAgent(vehicle, behavior='normal')
         agent.set_destination(destination.location)
@@ -167,4 +176,5 @@ if __name__ == '__main__':
 
     grp = GlobalRoutePlanner(world.get_map(), 2.0)
     #print(run_batch(client, world, pilot_factory, 'v2_lights'))
-    print(run_route(client, world, pilot_factory, ROUTES[5], grp))
+    print(run_route(client, world, traced_pilot_factory('route5_demagic'),
+                    ROUTES[5], grp))

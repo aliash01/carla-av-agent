@@ -2,7 +2,7 @@
 A staged autonomous driving agent and evaluation benchmark for CARLA 0.10 (UE5).
 
 ## Status
-Working: benchmark + baseline + PilotAgent v2.4 - lane discipline, traffic lights, obstacle response, live traffic, speed-limit control, unsticking past blockers. Next: sampling-based local planner (feasible trajectories + footprint collision checks), or camera perception.
+Working: benchmark + baseline + PilotAgent v2.9 - lane discipline, traffic lights, closing-speed following, live traffic, speed-limit control, unsticking past blockers with a planner-certified manoeuvre. Next: camera perception, or feedforward steering.
 
 ## Setup
 1. CARLA 0.10 (UE5) built from source; start the server:
@@ -461,6 +461,72 @@ metrics reproduce within the same noise band as same-session repeats
 (route 2: 187.60s/9 inv vs 187.65s/8), so the light-phase reset makes
 reproducibility a property of the benchmark, not of a server session.
 
+### v2.9 - de-magic IV: the planner checks the path actually driven
+
+Last scale assumptions gone (S_FLOOR 4m, REVERSE_CLEAR_M 8m, REJOIN_FLOOR_M 5m,
+REVERSE_MAX_M 8m, REAR_CLEAR_M 10m): blend lengths derive from a measured full-lock
+turning radius (R_TURN = 2.58m), and reversing continues until the planner says a
+swing-out exists. Route 5 fell to 52% and a timeout - the constants had masked that
+nothing checked whether the van could follow the path the planner certified.
+
+The footprint was the headline. Three circles per vehicle, each reaching the corner of
+the third it covered, bulged 0.41m past every flank: passing route 5's blocker (a 6.36m
+ambulance, not the guessed 2.4m half-length) needed 3.58m of lateral room in a 3.50m
+lane. A legal pass could never be certified, so "feasible" only became true once the
+ambulance left the sweep horizon - the van reversed until it stopped *seeing* it. Exact
+oriented rectangles (separating-axis test) replaced them: exact, and 1.4-1.7x faster with
+no square roots. True walls need 2.17m; clearance is now +1.06m where it used to overlap.
+
+Four more checks that assumed instead of measuring:
+- "am I past it?" used that guessed half-length - now the real box on our heading
+- the rejoin was never swept, only the swing-out - now gated through plan()
+- 1m sampling could straddle the closest approach (a blend moves 0.82m sideways per metre,
+  more than MARGIN) - the step now derives from each candidate's rate to a declared 5cm
+- the horizon stopped at blend + 8m, so "clear" could mean "never looked"
+
+Two deadlocks, each hidden by the other:
+- the v2.7 follow latch released only on evidence about the leader, so a van stopped
+  beyond FOLLOW_GAP+0.5 behind a *stationary* one was pinned forever: closing 0 so brake
+  0, hold suppressing throttle, and a van that cannot move never sees a leader pull away
+  (236s frozen). Releasing at standstill lets it close up and pin - which is also what
+  lets the unstick gate be reached at all
+- blends advance by distance, so a van wedged mid-manoeuvre never finishes one (149.7s at
+  full throttle). A no-progress escape abandons the deviation after the same 10s budget
+
+Execution was the other half: the aim point was shifted by the offset owed *here*, but
+sits ~4m ahead where the blend has grown, so the van steered for a fraction of the shift,
+levelled out on heading and drifted straight at the blocker. Shifting it by the offset
+owed AT the aim point cut peak lag 2.47 -> 1.70m and collisions 54 -> 7, lane-following
+bit-identical. EXEC_LAG = 1.8 then sweeps the slower path actually driven, so the van
+waits for room to be *settled* rather than settling as it passes, and a runtime check
+holds throttle whenever it falls behind that certified path.
+
+| route | scenario        | sim_time_s | collisions | solid_inv | lane_inv | avg km/h | min clear m | completion |
+|-------|-----------------|-----------|------------|-----------|----------|----------|-------------|------------|
+| 2     | empty           | 187.60    | 0          | 0         | 8        | 14.7     | n/a         | 100%       |
+| 5     | parked blocker  | 187.60    | 0          | 0         | 17       | 15.0     | +1.06       | 100%       |
+| 6     | 20 TM vehicles  | 187.65    | 0          | 0         | 8        | 14.7     | -0.56 *     | 100%       |
+
+Route 5 beats v2.4 (193.6s, 14.4 km/h) and is provably clear, not merely uncollided;
+15 -> 17 invasions is the cost of swinging out earlier. Route 2 saw no vehicle in 3752
+ticks, so its match is structural. (*) Route 6's -0.56m is conservative box overlap on
+close passes with no contact - min_clearance is a safe proxy, not a collision predictor -
+and it never left FOLLOWING, so it tests the latch fix, not the planner.
+
+Null results, recorded in code: scaling the cross-track gain by the blend's remaining room
+grows unbounded as it closes (245/288 ticks at full lock, 4.9m off route, 12%); a quintic
+blend with zero end curvature changed nothing (lag 2.03 -> 2.07m) and cost clearance
+(0.834 -> 0.480m). Both failed for one reason, measurable throughout - at peak error the
+controller commands 0.21 of full lock, so steering authority was never the constraint. The
+lag is the control law's convergence distance (K = 0.15 corrects over ~5.87m, about a
+whole blend); feedforward from path curvature is the fix, and the next chapter.
+
+Limits: EXEC_LAG is from one route and fails unsafe if real lag is worse (the runtime check
+makes it observable, not safe); the sweep checks a future path against a present-tense
+world; geometry is 2D, so an overpass reads as an obstacle; fine sampling is a resolution,
+not a provable bound; no route combines a blocker with traffic, so the lane-entry gates
+have never had to refuse.
+
 ## Assumptions
 
 The agent currently assumes solved perception and localisation, and says so
@@ -490,6 +556,9 @@ own ground truth, independently of what the agent believed).
 ## Notes / future metrics
 - BehaviorAgent overshoots stop lines with long vehicles
 - Straddles lanes when changing before junctions
-- Lane-centring error (distance from lane centreline, per tick)
+- Lane-centring error: implemented - the control trace carries `cross`, `track_err` and
+  `clearance` per tick, summarised by `scripts/track_error.py`
 - Baseline (BehaviorAgent) rows predate the red_light_violations column - re-run pending
+- No scenario combines a stationary blocker with traffic, so the lane-entry gates have
+  never had to refuse a manoeuvre - candidate route 7
 - Violation counter can double-count a light a blind agent re-passes; rankings unaffected
