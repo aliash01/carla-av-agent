@@ -1,4 +1,4 @@
-import sys, os, csv
+import sys, os, csv, random
 sys.path.insert(0, r'C:\CarlaUE5\PythonAPI\carla')
 
 from typing import Callable
@@ -9,6 +9,18 @@ from agent.pilot_agent import PilotAgent
 from agents.navigation.global_route_planner import GlobalRoutePlanner
 
 FIXED_DELTA_S = 0.05
+
+
+def _neighbour_lane(wp):
+    """First drivable SAME-DIRECTION neighbour of wp, or None. Map-derived rather than
+    a hand-picked spawn point, so an adjacent-lane scenario works on any route with a
+    neighbour. Same direction only: the agent never overtakes into oncoming traffic, so
+    an oncoming neighbour is not a lane it could ever choose."""
+    for cand in (wp.get_right_lane(), wp.get_left_lane()):
+        if (cand is not None and cand.lane_type == carla.LaneType.Driving
+                and cand.lane_id * wp.lane_id > 0):
+            return cand
+    return None
 
 
 def run_route(client: carla.Client,
@@ -84,6 +96,24 @@ def run_route(client: carla.Client,
                     traffic_vehicles.append(tv)
             world.tick()   # let spawns + TM registration settle before the run starts
 
+        # scenario: an open-ended stream into the neighbouring lane, released from our
+        # own start at random intervals, so the ego has to find its own gap rather than
+        # wait out a fixed queue. Seeded, so the arrival pattern is reproducible.
+        adj_cfg, adj_tf, adj_bps, adj_rng = None, None, None, None
+        adj_next, adj_done, adj_spawned = 0, False, 0
+        adj_live = []                   # active stream cars, oldest first
+        if "adjacent_traffic" in route_def:
+            adj_cfg = route_def["adjacent_traffic"]
+            trafficManager.set_random_device_seed(adj_cfg["seed"])
+            adj_rng = random.Random(adj_cfg["seed"])
+            neighbour = _neighbour_lane(route[0][0])
+            if neighbour is None:
+                raise RuntimeError("adjacent_traffic: no same-direction neighbour lane "
+                                   "at the route start")
+            adj_tf = neighbour.transform
+            adj_tf.location.z += 0.5                      # drop on, don't clip
+            adj_bps = bp_lib.filter('vehicle.*')
+
         # lights keep cycling between runs, so each run would otherwise start at an
         # arbitrary phase - measured 34s of variance on route 2 from this alone.
         # Reset to phase zero so runs are reproducible and agents comparable.
@@ -93,6 +123,72 @@ def run_route(client: carla.Client,
 
         while not agent.done():
             world.tick()
+            # stop the stream once the ego is fully past the blocker: it found its gap,
+            # and the rest of the route should run normally. Judged geometrically from
+            # the two footprints - the benchmark takes any agent through a factory, so
+            # it must not read the agent's own state to decide this.
+            if adj_cfg is not None and not adj_done and obstacle is not None:
+                ol, el = obstacle.get_location(), vehicle.get_location()
+                fo = obstacle.get_transform().get_forward_vector()
+                if (fo.x * (el.x - ol.x) + fo.y * (el.y - ol.y)
+                        > vehicle.bounding_box.extent.x + obstacle.bounding_box.extent.x):
+                    adj_done = True
+                    # the test window is over: give them their lane changes back. Locked,
+                    # a car whose lane ends has nowhere to go - one sat pinned alongside
+                    # and scraped us for a second where the right lane runs out.
+                    for tv in adj_live:
+                        if tv.is_alive:
+                            trafficManager.auto_lane_change(tv, True)
+            if (adj_cfg is not None and not adj_done and ticks >= adj_next):
+                # rolling window: cull the longest-serving car to make room, but only
+                # once it is outside our perception range. Culling one still in range
+                # would delete a leader mid-decision and release the follow latch -
+                # inventing agent behaviour rather than testing it.
+                if len(adj_live) >= adj_cfg["active"]:
+                    el = vehicle.get_location()
+                    for i, tv in enumerate(adj_live):
+                        if not tv.is_alive or tv.get_location().distance(el) > 40.0:
+                            if tv.is_alive:
+                                tv.set_autopilot(False)
+                                tv.destroy()
+                            adj_live.pop(i)
+                            break
+                if len(adj_live) < adj_cfg["active"]:
+                    # spawn RELATIVE TO THE EGO, a set distance back in the neighbouring
+                    # lane. A fixed point at the route start was rate-limited to a
+                    # trickle - it stays blocked while a car accelerates from rest, so
+                    # most attempts failed and only 2 cars ever appeared. A point that
+                    # moves with us is always clear, and the cars always arrive from
+                    # behind at speed, which is the case worth testing.
+                    ewp = world.get_map().get_waypoint(vehicle.get_location())
+                    back = ewp.previous(adj_cfg["behind_m"]) if ewp is not None else []
+                    lane = _neighbour_lane(back[0]) if back else None
+                    if lane is None:
+                        adj_next = ticks + 20        # no neighbour lane back there
+                        tv = None
+                    else:
+                        adj_tf = lane.transform
+                        adj_tf.location.z += 0.5
+                        tv = world.try_spawn_actor(
+                            adj_bps[adj_spawned % len(adj_bps)], adj_tf)
+                    if tv is None:
+                        adj_next = max(adj_next, ticks + 10)   # busy: retry in 0.5s
+                    else:
+                        tv.set_autopilot(True, trafficManager.get_port())
+                        # keep them in the lane we put them in: by default TM
+                        # lane-changes them, and they drifted into OUR lane and queued
+                        # behind the ego, which blocks reversing and stops the
+                        # manoeuvre being tested at all
+                        trafficManager.auto_lane_change(tv, False)
+                        adj_live.append(tv)
+                        traffic_vehicles.append(tv)
+                        adj_spawned += 1
+                        # start frequent and thin out, so early cars deny the gap and
+                        # later ones eventually grant one - the ego has to spot it
+                        lo, hi = adj_cfg["interval_s"]
+                        grow = adj_cfg["growth"] ** (adj_spawned - 1)
+                        adj_next = ticks + max(
+                            1, round(adj_rng.uniform(lo, hi) * grow / FIXED_DELTA_S))
             recorder.on_tick(vehicle)
             vehicle.apply_control(agent.run_step())
             ticks += 1
@@ -129,6 +225,10 @@ def run_route(client: carla.Client,
             "timeout": timed_out,
             "sim_time_s": ticks * FIXED_DELTA_S,
             "error": error,
+            # a scenario that spawned fewer cars than intended is not the scenario we
+            # designed - surface the count rather than reading a clean run
+            "traffic_spawned": adj_spawned if "adjacent_traffic" in route_def
+                               else len(traffic_vehicles),
             **metrics}
 
 def run_batch(client, world, agent_factory, out_name: str) -> list:

@@ -2,7 +2,7 @@
 A staged autonomous driving agent and evaluation benchmark for CARLA 0.10 (UE5).
 
 ## Status
-Working: benchmark + baseline + PilotAgent v2.9 - lane discipline, traffic lights, closing-speed following, live traffic, speed-limit control, unsticking past blockers with a planner-certified manoeuvre. Next: camera perception, or feedforward steering.
+Working: benchmark + baseline + PilotAgent v2.10 - lane discipline, traffic lights, closing-speed following, live traffic, speed-limit control, unsticking past blockers with a planner-certified manoeuvre, tested against traffic in the target lane. Next: camera perception, or feedforward steering.
 
 ## Setup
 1. CARLA 0.10 (UE5) built from source; start the server:
@@ -527,6 +527,43 @@ world; geometry is 2D, so an overpass reads as an obstacle; fine sampling is a r
 not a provable bound; no route combines a blocker with traffic, so the lane-entry gates
 have never had to refuse.
 
+### v2.10 - route 7: the lane-entry gates, finally exercised
+
+A blocker plus a stream in the neighbouring lane, so v2.8's gates must refuse for real.
+Cars release 60m behind the ego at intervals that start frequent and thin out (1.5-3s,
+x1.35 each), capped at 4 active, oldest culled only once beyond perception range - culling
+one still in range would delete a leader mid-decision and invent behaviour rather than test
+it. The stream stops once the ego is past the blocker, judged geometrically: the benchmark
+takes any agent through a factory, so it must not read the agent's state.
+
+Two scenario faults, each of which silently emptied the test. A fixed spawn point at the
+route start is rate-limited to a trickle - blocked while a car pulls away from rest, it gave
+2 cars in 45s. And TM lane-changes them by default, so they drifted into OUR lane and queued
+on the ego's bumper, blocking reversing entirely; locking their lane fixes that but must be
+released afterwards, or a car whose lane runs out has nowhere to go and scrapes past.
+
+Three agent bugs routes 2, 5 and 6 could not show:
+
+1. Livelock: no feasible swing-out and a car on the bumper (so no room to reverse), yet the
+   machine entered PREPARING anyway and rediscovered the same infeasibility every 11s, 16
+   times, until the car behind moved. It now waits.
+2. It discarded the room it reversed for - v2.9's standstill release closed the gap back up
+   to FOLLOW_GAP, so the van reversed, crept forward, reversed again. It now holds the gap.
+3. Holding deadlocked in turn: the stall counter accrues only while "held" (close behind the
+   blocker), so holding a gap reset it every tick, the gate never reopened, 362s frozen. It
+   now accrues while holding too.
+
+Three deadlocks this chapter, one signature: a latch whose release condition can only be
+observed by doing what the latch prevents. Worth checking whenever one is added.
+
+| route | scenario           | sim_time_s | collisions | solid_inv | lane_inv | avg km/h | completion |
+|-------|--------------------|-----------|------------|-----------|----------|----------|------------|
+| 7     | blocker + adjacent | 248.0     | 0          | 0         | 17       | 11.5     | 100%       |
+
+Gates now refuse live on three of four branches (beside 52 ticks, behind_gap 43, ahead_gap
+13, one PREPARING abort). TTC stays synthetic-only: it needs a car far enough back to look
+clear while closing too fast, which this stream does not reliably produce.
+
 ## Assumptions
 
 The agent currently assumes solved perception and localisation, and says so
@@ -559,6 +596,7 @@ own ground truth, independently of what the agent believed).
 - Lane-centring error: implemented - the control trace carries `cross`, `track_err` and
   `clearance` per tick, summarised by `scripts/track_error.py`
 - Baseline (BehaviorAgent) rows predate the red_light_violations column - re-run pending
-- No scenario combines a stationary blocker with traffic, so the lane-entry gates have
-  never had to refuse a manoeuvre - candidate route 7
+- TTC branch of the lane-entry gates still only synthetically tested: it needs a car far
+  enough back to look clear while closing too fast, which route 7's stream does not
+  reliably produce
 - Violation counter can double-count a light a blind agent re-passes; rankings unaffected

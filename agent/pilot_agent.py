@@ -81,6 +81,13 @@ class PilotAgent:
         self._return_length = 1.0
         self._return_phase = 0.0
         self._noprogress_ticks = 0      # commanded to proceed but not moving
+        self._made_room = False         # reversed for a blocker: hold the gap
+        self._gate_reason = ''          # why the unstick gate last refused
+        self._lane_reason = ''          # which lane check last refused
+        self._lane_nums = (None,) * 4   # (ahead gap, closing, behind gap, closing)
+        self._n_vehicles = 0            # trace only, logged every tick
+        self._rear_gap = None
+        self._lane_state = ''
         self._clearance = None          # measured gap to the nearest vehicle,
                                         # trace only (see min_clearance)
         self._cross = 0.0             # last tick's achieved offset from the route line,
@@ -96,7 +103,9 @@ class PilotAgent:
             self._trace_writer = csv.writer(self._trace)
             self._trace_writer.writerow(
                 ['tick', 'throttle', 'steer', 'brake', 'reverse', 'state', 'lane_offset',
-                 'cross', 'track_err', 'speed', 'clearance'])
+                 'cross', 'track_err', 'speed', 'clearance', 'gate',
+                 'ahead_gap', 'ahead_closing', 'behind_gap', 'behind_closing',
+                 'n_vehicles', 'rear_gap', 'lane_right'])
 
     def run_step(self):
         """Thin wrapper: compute the control, optionally trace it, return it unchanged."""
@@ -109,7 +118,12 @@ class PilotAgent:
                  self.state.name, repr(self.lane_offset),
                  repr(self._cross), repr(self._cross - self.lane_offset),
                  repr(self.vehicle.get_velocity().length()),
-                 '' if self._clearance is None else repr(self._clearance)])
+                 '' if self._clearance is None else repr(self._clearance),
+                 self._gate_reason,
+                 *('' if v is None else repr(v) for v in self._lane_nums),
+                 self._n_vehicles,
+                 '' if self._rear_gap is None else f'{self._rear_gap:.2f}',
+                 self._lane_state])
             self._trace.flush()
         self._trace_tick += 1
         return control
@@ -129,6 +143,17 @@ class PilotAgent:
             self._clearance = min_clearance(
                 tf.location.x, tf.location.y, math.radians(tf.rotation.yaw),
                 (self.half_length, self.half_width), obs["vehicles"])
+            self._n_vehicles = len(obs["vehicles"])
+            self._rear_gap = obs["rear"]
+            lane = obs["lane_right"]
+            if lane is None:
+                self._lane_state = 'none'
+            else:
+                a, b = lane["ahead"], lane["behind"]
+                self._lane_state = (
+                    ('beside' if lane["beside"] else 'clear')
+                    + (f" a{a[0]:.1f}/{a[1]:+.1f}" if a else " a-")
+                    + (f" b{b[0]:.1f}/{b[1]:+.1f}" if b else " b-"))
 
         # reversing has its own control path (rear target, inverted kinematics).
         # Exit is feasibility-driven: back up only until the planner says a
@@ -147,6 +172,7 @@ class PilotAgent:
                     or (obs["rear"] is not None and obs["rear"] < FOLLOW_GAP)):
                 self.state = Manoeuvre.PREPARING
                 self._prepare_ticks = 0
+                self._made_room = True    # keep this gap: see _update_manoeuvre
                 return carla.VehicleControl(brake=1.0)        # settle before swinging out
             return self._reverse_step(loc)
 
@@ -265,7 +291,11 @@ class PilotAgent:
         # stall counter: hazard reports this tick's fact, the machine owns the history
         if obs["obstacle"] is None:
             self._blocked_ticks = 0
-        elif hazard["held"]:
+        elif hazard["held"] or self._made_room:
+            # _made_room counts too: holding a gap we reversed for IS being blocked, and
+            # without this the counter resets every tick (we are no longer close enough
+            # to be "held"), the gate never reopens, and the van holds its room forever -
+            # 362s frozen, the same shape of deadlock as the follow latch and the wedge.
             if obs["speed"] < STOPPED_MS:
                 self._blocked_ticks += 1                      # accruing stall time
         else:
@@ -292,6 +322,19 @@ class PilotAgent:
             self.state = Manoeuvre.FOLLOWING
             return
 
+        # hold the gap we reversed for. The follow rule would otherwise close back up to
+        # FOLLOW_GAP (it releases at standstill so it can pin properly), which throws
+        # away the room the reverse just bought: observed reversing, creeping forward,
+        # reversing again while waiting for a gap in the next lane. Released when the
+        # blocker is gone or the manoeuvre is over.
+        if self._made_room:
+            if obs["obstacle"] is None or self.state in (Manoeuvre.CHANGING,
+                                                         Manoeuvre.RETURNING):
+                self._made_room = False
+            elif self.state is Manoeuvre.FOLLOWING:
+                hazard["hold"] = True
+                hazard["brake"] = 1.0
+
         loc = obs["loc"]
         wp_here = self.map.get_waypoint(loc)
         lane_w = wp_here.lane_width if wp_here else 3.5
@@ -309,11 +352,18 @@ class PilotAgent:
                 elif obs["rear"] is None or obs["rear"] > FOLLOW_GAP:
                     self.state = Manoeuvre.REVERSING          # infeasible: back up to make room
                 else:
-                    self.state = Manoeuvre.PREPARING          # nowhere to reverse: try anyway
+                    # boxed in: no feasible swing-out, and someone on our bumper so we
+                    # cannot make room either. Wait. Going to PREPARING here was a
+                    # livelock - route 7 spent 16 cycles of 11s each rediscovering the
+                    # same infeasibility, until the car behind happened to move.
+                    self._gate_reason = 'boxed_in'
 
         elif self.state is Manoeuvre.PREPARING:
             self.lane_offset = 0.0
             if not self._lane_is_safe(self._overtake_side, obs):
+                # record it: this caller, not _unstick_gate, is where route 7's eight
+                # refusals actually happened, and the first run could not show it
+                self._gate_reason = f'abort:{self._overtake_side}:{self._lane_reason}'
                 self.state = Manoeuvre.FOLLOWING              # abort before moving
             else:
                 self._prepare_ticks += 1
@@ -579,7 +629,17 @@ class PilotAgent:
         from closing + ours) - entering must not force anyone into
         tailgating. Standstill floor either way; TTC rejects fast arrivals."""
         info = obs["lane_left"] if side == 'left' else obs["lane_right"]
-        if info is None or info["beside"]:
+        self._lane_nums = (None, None, None, None)
+        if info is None:
+            self._lane_reason = 'absent'      # missing, undrivable or oncoming
+            return False
+        # keep the (gap, closing) pairs the decision rests on: "the gate refused" is
+        # not evidence the gate was RIGHT - that needs the numbers it compared
+        a, b = info["ahead"], info["behind"]
+        self._lane_nums = (a[0] if a else None, a[1] if a else None,
+                           b[0] if b else None, b[1] if b else None)
+        if info["beside"]:
+            self._lane_reason = 'beside'
             return False
         speed = obs["speed"]
         for key, hit in (("ahead", info["ahead"]), ("behind", info["behind"])):
@@ -592,25 +652,40 @@ class PilotAgent:
                 their_speed = max(0.0, closing + speed)   # behind: closing = theirs - ours
                 min_gap = max(FOLLOW_GAP, HEADWAY_S * their_speed)
             if gap < min_gap:
+                self._lane_reason = f'{key}_gap'
                 return False
             if closing > 0.1 and gap / closing < LANE_TTC_MIN:   # arriving too soon
+                self._lane_reason = f'{key}_ttc'
                 return False
+        self._lane_reason = ''
         return True
 
     def _unstick_gate(self, obs):
+        """Which side to move out to, or None. Records WHY it refused: a van that
+        simply waits is indistinguishable in the trace from one that never looked,
+        so without this a clean run cannot tell us the gates were exercised at all
+        (route 6 taught us that lesson the expensive way)."""
         if self._blocked_ticks < STALL_TICK_LIMIT:
+            self._gate_reason = 'waiting'
             return None
         red = obs["light"]
         if red is not None and red <= 25.0:
+            self._gate_reason = 'light'
             return None
         upcoming = self.route[self.target_index:self.target_index + 10]
         if any(opt != RoadOption.LANEFOLLOW for _, opt in upcoming):
+            self._gate_reason = 'junction'
             return None
         if self._queue_beyond(obs["loc"], obs["obstacle"]):
+            self._gate_reason = 'queue'
             return None
+        refused = []
         for side in ('left', 'right'):
             if self._lane_is_safe(side, obs):
+                self._gate_reason = ''
                 return side
+            refused.append(f'{side}:{self._lane_reason}')
+        self._gate_reason = '|'.join(refused)
         return None
 
     def _queue_beyond(self, loc, obs_dist):
