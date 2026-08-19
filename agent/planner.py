@@ -43,7 +43,22 @@ LATERAL_RES = 0.05    # declared: resolve the swept path to 5cm laterally. The o
 STEP_CAP = 1.0        # metres; also bounded by the ego half-length below so successive
                       # footprints always overlap and nothing can pass between them
 TAIL = 8.0            # keep checking this far beyond the blend, metres
-T_BLEND = 1.5         # blend length grows with speed: L = speed * T_BLEND, seconds
+T_BLEND = 1.5         # blend length grows with speed: L = speed * T_BLEND, seconds.
+                      # KNOWN UNPRINCIPLED, and a principled replacement was tried and
+                      # REVERTED. For a lane-width shift this implies ~7.7 m/s^2 sideways -
+                      # above the 4.46 the van ever achieves - so the blend demands
+                      # cornering it cannot deliver. Deriving the length from a declared
+                      # lateral comfort limit instead (1.6 m/s^2, the p90 of this agent's
+                      # own bends on route 2, matching COMFORT_DECEL) roughly doubles the
+                      # length above 2 m/s, and made things worse: route 5 clearance
+                      # +1.06m -> -0.081m, peak lag 1.70 -> 2.25m, route 7 248s -> 308s.
+                      # A longer blend reaches full offset LATER in absolute distance, so
+                      # the van is less far over when it draws level - the same failure as
+                      # the quintic shape. Lag is the control law's convergence rate, not
+                      # the path's difficulty, so no path-side change helps: with the
+                      # comfort limit set to 1.6 the van still measured p95 2.13, because
+                      # it does not follow the blend it is given. Revisit once the
+                      # controller has feedforward and actually tracks.
 S_CAP = 25.0          # maximum blend length, metres
 W_OFFSET = 1.0        # cost per metre of lateral deviation ("last resort")
 W_BEND = 2.0          # cost per (metre of offset change / metre travelled)

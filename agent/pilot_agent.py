@@ -121,7 +121,7 @@ class PilotAgent:
                 ['tick', 'throttle', 'steer', 'brake', 'reverse', 'state', 'lane_offset',
                  'cross', 'track_err', 'speed', 'clearance', 'gate',
                  'ahead_gap', 'ahead_closing', 'behind_gap', 'behind_closing',
-                 'n_vehicles', 'rear_gap', 'lane_right', 'decel_est'])
+                 'n_vehicles', 'rear_gap', 'lane_right', 'decel_est', 'lat_accel'])
 
     def run_step(self):
         """Thin wrapper: compute the control, optionally trace it, return it unchanged."""
@@ -140,7 +140,9 @@ class PilotAgent:
                  self._n_vehicles,
                  '' if self._rear_gap is None else f'{self._rear_gap:.2f}',
                  self._lane_state,
-                 f'{self._decel_per_brake:.3f}'])
+                 f'{self._decel_per_brake:.3f}',
+                 f'{abs(math.radians(self.vehicle.get_angular_velocity().z)
+                        * self.vehicle.get_velocity().length()):.4f}'])
             self._trace.flush()
         self._prev_brake = control.brake
         self._trace_tick += 1
