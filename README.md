@@ -2,7 +2,7 @@
 A staged autonomous driving agent and evaluation benchmark for CARLA 0.10 (UE5).
 
 ## Status
-Working: benchmark + baseline + PilotAgent v2.10 - lane discipline, traffic lights, closing-speed following, live traffic, speed-limit control, unsticking past blockers with a planner-certified manoeuvre, tested against traffic in the target lane. Next: camera perception, or feedforward steering.
+Working: benchmark + baseline + PilotAgent v2.11 - lane discipline, traffic lights, closing-speed following, live traffic, speed-limit control, unsticking past blockers with a planner-certified manoeuvre tested against traffic in the target lane, and braking scaled by a figure the van measures on itself. Next: camera perception, or feedforward steering.
 
 ## Setup
 1. CARLA 0.10 (UE5) built from source; start the server:
@@ -508,7 +508,8 @@ holds throttle whenever it falls behind that certified path.
 | 6     | 20 TM vehicles  | 187.65    | 0          | 0         | 8        | 14.7     | -0.56 *     | 100%       |
 
 Route 5 beats v2.4 (193.6s, 14.4 km/h) and is provably clear, not merely uncollided;
-15 -> 17 invasions is the cost of swinging out earlier. Route 2 saw no vehicle in 3752
+15 -> 17 invasions is within noise, not a cost: the metric spans 15-19 across runs of
+identical behaviour, so only differences of 4 or more mean anything here. Route 2 saw no vehicle in 3752
 ticks, so its match is structural. (*) Route 6's -0.56m is conservative box overlap on
 close passes with no contact - min_clearance is a safe proxy, not a collision predictor -
 and it never left FOLLOWING, so it tests the latch fix, not the planner.
@@ -564,6 +565,35 @@ Gates now refuse live on three of four branches (beside 52 ticks, behind_gap 43,
 13, one PREPARING abort). TTC stays synthetic-only: it needs a car far enough back to look
 clear while closing too fast, which this stream does not reliably produce.
 
+### v2.11 - de-magic V: the van measures its own braking
+
+MAX_DECEL was an open-loop inverse model - brake = a_req / MAX_DECEL - so a wrong constant
+mis-scaled every brake command and nothing noticed. It is now estimated from the van's own
+behaviour: achieved deceleration divided by the pedal fraction that produced it, filtered
+with a 2s time constant (seconds, not ticks, so it is independent of the fixed delta) and
+updated only while genuinely braking above 1 m/s, since a light pedal or a near standstill
+makes the ratio meaningless.
+
+The evidence is a perturbation test rather than "the stops look fine": starting the estimate
+at 3.0, 6.0 and 9.0 all converged on 7.09 m/s2 with identical route 5 results, so the
+constant is no longer load-bearing. 7.09 is the measured truth, and the old 6.0 made every
+brake ~15% too gentle. MAX_DECEL is now that measured figure rather than a deliberately low
+one - keeping the feedforward wrong to buy margin is hidden conservatism, a magic number
+nobody can audit, and caution belongs in an explicit bias instead.
+
+Braking varies ~15% with speed (6.5 m/s2 at crawl, 7.5 at 8 m/s): one scalar is adequate
+across a town's range and would need binning on faster roads. Weather would move it 3-8x,
+which the estimate follows and a constant cannot.
+
+| route | scenario       | sim_time_s | collisions | solid_inv | lane_inv | avg km/h | completion |
+|-------|----------------|-----------|------------|-----------|----------|----------|------------|
+| 5     | parked blocker | 187.55    | 0          | 0         | 19       | 15.0     | 100%       |
+
+Limits: only graduated braking uses the estimate - emergency cases command brake = 1.0
+directly. The first stop after conditions change still holds the stale figure, which an
+explicit pessimistic bias would cover. And CARLA's weather presets appear not to touch tyre
+friction, so wet braking is untested rather than known-good.
+
 ## Assumptions
 
 The agent currently assumes solved perception and localisation, and says so
@@ -600,3 +630,8 @@ own ground truth, independently of what the agent believed).
   enough back to look clear while closing too fast, which route 7's stream does not
   reliably produce
 - Violation counter can double-count a light a blind agent re-passes; rankings unaffected
+- Wet / low-friction braking untested - CARLA's weather presets appear not to change tyre
+  friction, so it needs `tire_friction` lowered directly or a friction trigger. A
+  pessimistic bias on the braking estimate would cover the first stop after a change
+- Route 5 lane invasions carry about +/-3 of run-to-run noise (15-19 across identical
+  behaviour), so only differences of 4 or more are meaningful
