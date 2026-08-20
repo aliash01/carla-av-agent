@@ -2,7 +2,7 @@
 A staged autonomous driving agent and evaluation benchmark for CARLA 0.10 (UE5).
 
 ## Status
-Working: benchmark + baseline + PilotAgent v2.4 - lane discipline, traffic lights, obstacle response, live traffic, speed-limit control, unsticking past blockers. Next: sampling-based local planner (feasible trajectories + footprint collision checks), or camera perception.
+Working: benchmark + baseline + PilotAgent v2.12 - lane discipline, traffic lights, closing-speed following, live traffic, speed-limit control, unsticking past blockers with a planner-certified manoeuvre tested against traffic in the target lane, and braking scaled by a figure the van measures on itself. Next: camera perception, or feedforward steering.
 
 ## Setup
 1. CARLA 0.10 (UE5) built from source; start the server:
@@ -367,6 +367,258 @@ scoring weights, margins) are declared first guesses - the next unit converts
 scale-assuming values (fixed metres and durations) to generalisable
 references: lane widths, footprints, time headways and v²/2a physics.
 
+### v2.6 - de-magic I: physics-derived light response
+
+First of a series converting scale assumptions (fixed metres, guessed rates)
+into generalisable references: map geometry, vehicle calibration, physics.
+
+Coast-down calibration: the Sprinter's engine-off deceleration was measured
+(throttle to top speed, release, record per-tick decel, samples gated on
+near-zero steering): 0.10-0.26 m/s2 across 13-23 km/h, rising with speed.
+COAST_DECEL = 0.8 was therefore wrong by 4-8x - the agent's "coast
+preference" was largely fictional; the brake was doing almost all the work.
+True coast-to-stop from 25 km/h would need ~120m, so coast-first is bounded
+by a comfort-braking tier.
+
+Light response: the 20m engagement gate is gone. The van now engages when
+the deceleration needed to stop at the line (v^2/2d) reaches COMFORT_DECEL -
+correct at any speed, where the fixed gate assumed town speeds. COMFORT_DECEL
+= 1.6 m/s2 is a declared, sweepable preference, back-derived from the old
+gate's own behaviour at benchmark top speed (7.94^2/(2*20) ~= 1.6), so
+benchmark behaviour is preserved by construction. Stopped-at-line holding is
+its own explicit condition (a_req = 0 at standstill would otherwise release
+the hold and run the light), cleared when the light stops reporting red.
+
+Finding - thresholds chatter without memory: the bare physics threshold
+doubled brake episodes (route 2: 23 -> 55); braking lowers a_req below the
+threshold, releasing the brake, which raises a_req again. Same failure the
+planner's hysteresis prevents laterally. Fixed by latching the committed
+stop until the light clears: 6 episodes - one committed stop per red -
+against 23 under the old gate, which had its own mild flicker. Route 6's
+episode count is unchanged (164): its braking is obstacle-following, the
+unconverted block, which is the next conversion.
+
+Metrics unchanged throughout: 0 violations, 0 collisions, 100%, sim times
+within a tick of 187.65s. Residual: _perceive_traffic_light's 25m range
+covers comfort engagement only up to ~32 km/h - a sensor-model conversion,
+pending.
+
+### v2.7 - de-magic II: closing-speed following
+
+The obstacle block converted: FOLLOW_GAP now applies only at standstill (a
+declared "see their tyres" convention, 2.5m bumper-to-bumper); the moving
+follow gap is a time headway (HEADWAY_S = 2.0s, the Highway Code two-second
+rule) - time scales from car park to motorway where fixed metres cannot.
+Engagement and latching follow v2.6's pattern.
+
+Two failures on the way, both caught by the benchmark before commit:
+
+1. Absolute-speed physics in traffic: carrying v^2/2d over from the light
+   stop treats every leader as a wall. A same-speed TM vehicle inside the
+   desired gap read as an emergency -> full brake in flowing traffic -> 32
+   rear-end collisions from following NPCs (route 6). Fixed by braking on
+   CLOSING SPEED: _perceive_obstacle now returns (gap, closing) - radar's
+   native pair, same convention as _perceive_lane - and a_req =
+   closing^2/2d stops the gap shrinking rather than the van. A stationary
+   blocker gives closing = our speed, so route 5 and light stops are
+   unchanged by construction.
+
+2. Latch release via the gap re-oscillated (route 5: 58 episodes): the
+   desired gap moves with our own speed, so braking "restored" it, released
+   the latch, sped up, re-latched. Release now keys only on evidence about
+   the leader - pulling away or gone - never on quantities our own braking
+   moves. The v2.6 light latch had this property by accident; now it is a
+   stated rule.
+
+Brake episodes: route 6 133 -> 9, route 5 33 -> 7, route 2 unchanged.
+Metrics clean throughout (0 collisions, 0 solids, 0 violations, 100%,
+sim times unchanged at 187.65s). Average speed did not rise - route timing
+is light-dominated; the gain is comfort and legibility, not pace.
+
+Remaining scale assumptions, next in line: lane-entry gates (8m/10m),
+reverse clearances, blend lengths, route-membership tolerances, perception
+ranges (25/30/40m).
+
+### v2.8 - de-magic III: lane-entry gates from both seats
+
+LANE_CLEAR_AHEAD (8m) and LANE_CLEAR_BEHIND (10m) - invented in v2.3 -
+replaced by the v2.7 following rule applied symmetrically: entering a lane
+makes us a follower of the car ahead (our headway at OUR speed, standstill
+floor) and makes the car behind a follower of us (their headway at THEIR
+speed, reconstructed as closing + ours from the existing lane contract).
+Entering must not force anyone into tailgating. The TTC >= 3s check was
+already time-based and stays.
+
+The new gates are more permissive at low speed (floor 2.5m vs 8/10m) and
+stricter against fast approachers (a 36 km/h closer needs 20m + TTC, where
+10m used to pass). Nothing on the current routes exercises the gates
+(route 5's adjacent lane is empty), so validation is ten synthetic
+gate tests (floors, both headway directions, TTC, beside-veto) plus
+benchmark invisibility: brake profiles identical to v2.7, metrics clean.
+
+Incidental finding: first equivalence comparison across a server restart -
+metrics reproduce within the same noise band as same-session repeats
+(route 2: 187.60s/9 inv vs 187.65s/8), so the light-phase reset makes
+reproducibility a property of the benchmark, not of a server session.
+
+### v2.9 - de-magic IV: the planner checks the path actually driven
+
+Last scale assumptions gone (S_FLOOR 4m, REVERSE_CLEAR_M 8m, REJOIN_FLOOR_M 5m,
+REVERSE_MAX_M 8m, REAR_CLEAR_M 10m): blend lengths derive from a measured full-lock
+turning radius (R_TURN = 2.58m), and reversing continues until the planner says a
+swing-out exists. Route 5 fell to 52% and a timeout - the constants had masked that
+nothing checked whether the van could follow the path the planner certified.
+
+The footprint was the headline. Three circles per vehicle, each reaching the corner of
+the third it covered, bulged 0.41m past every flank: passing route 5's blocker (a 6.36m
+ambulance, not the guessed 2.4m half-length) needed 3.58m of lateral room in a 3.50m
+lane. A legal pass could never be certified, so "feasible" only became true once the
+ambulance left the sweep horizon - the van reversed until it stopped *seeing* it. Exact
+oriented rectangles (separating-axis test) replaced them: exact, and 1.4-1.7x faster with
+no square roots. True walls need 2.17m; clearance is now +1.06m where it used to overlap.
+
+Four more checks that assumed instead of measuring:
+- "am I past it?" used that guessed half-length - now the real box on our heading
+- the rejoin was never swept, only the swing-out - now gated through plan()
+- 1m sampling could straddle the closest approach (a blend moves 0.82m sideways per metre,
+  more than MARGIN) - the step now derives from each candidate's rate to a declared 5cm
+- the horizon stopped at blend + 8m, so "clear" could mean "never looked"
+
+Two deadlocks, each hidden by the other:
+- the v2.7 follow latch released only on evidence about the leader, so a van stopped
+  beyond FOLLOW_GAP+0.5 behind a *stationary* one was pinned forever: closing 0 so brake
+  0, hold suppressing throttle, and a van that cannot move never sees a leader pull away
+  (236s frozen). Releasing at standstill lets it close up and pin - which is also what
+  lets the unstick gate be reached at all
+- blends advance by distance, so a van wedged mid-manoeuvre never finishes one (149.7s at
+  full throttle). A no-progress escape abandons the deviation after the same 10s budget
+
+Execution was the other half: the aim point was shifted by the offset owed *here*, but
+sits ~4m ahead where the blend has grown, so the van steered for a fraction of the shift,
+levelled out on heading and drifted straight at the blocker. Shifting it by the offset
+owed AT the aim point cut peak lag 2.47 -> 1.70m and collisions 54 -> 7, lane-following
+bit-identical. EXEC_LAG = 1.8 then sweeps the slower path actually driven, so the van
+waits for room to be *settled* rather than settling as it passes, and a runtime check
+holds throttle whenever it falls behind that certified path.
+
+| route | scenario        | sim_time_s | collisions | solid_inv | lane_inv | avg km/h | min clear m | completion |
+|-------|-----------------|-----------|------------|-----------|----------|----------|-------------|------------|
+| 2     | empty           | 187.60    | 0          | 0         | 8        | 14.7     | n/a         | 100%       |
+| 5     | parked blocker  | 187.60    | 0          | 0         | 17       | 15.0     | +1.06       | 100%       |
+| 6     | 20 TM vehicles  | 187.65    | 0          | 0         | 8        | 14.7     | -0.56 *     | 100%       |
+
+Route 5 beats v2.4 (193.6s, 14.4 km/h) and is provably clear, not merely uncollided;
+15 -> 17 invasions is within noise, not a cost: the metric spans 15-19 across runs of
+identical behaviour, so only differences of 4 or more mean anything here. Route 2 saw no vehicle in 3752
+ticks, so its match is structural. (*) Route 6's -0.56m is conservative box overlap on
+close passes with no contact - min_clearance is a safe proxy, not a collision predictor -
+and it never left FOLLOWING, so it tests the latch fix, not the planner.
+
+Null results, recorded in code: scaling the cross-track gain by the blend's remaining room
+grows unbounded as it closes (245/288 ticks at full lock, 4.9m off route, 12%); a quintic
+blend with zero end curvature changed nothing (lag 2.03 -> 2.07m) and cost clearance
+(0.834 -> 0.480m). Both failed for one reason, measurable throughout - at peak error the
+controller commands 0.21 of full lock, so steering authority was never the constraint. The
+lag is the control law's convergence distance (K = 0.15 corrects over ~5.87m, about a
+whole blend); feedforward from path curvature is the fix, and the next chapter.
+
+Limits: EXEC_LAG is from one route and fails unsafe if real lag is worse (the runtime check
+makes it observable, not safe); the sweep checks a future path against a present-tense
+world; geometry is 2D, so an overpass reads as an obstacle; fine sampling is a resolution,
+not a provable bound; no route combines a blocker with traffic, so the lane-entry gates
+have never had to refuse.
+
+### v2.10 - route 7: the lane-entry gates, finally exercised
+
+A blocker plus a stream in the neighbouring lane, so v2.8's gates must refuse for real.
+Cars release 60m behind the ego at intervals that start frequent and thin out (1.5-3s,
+x1.35 each), capped at 4 active, oldest culled only once beyond perception range - culling
+one still in range would delete a leader mid-decision and invent behaviour rather than test
+it. The stream stops once the ego is past the blocker, judged geometrically: the benchmark
+takes any agent through a factory, so it must not read the agent's state.
+
+Two scenario faults, each of which silently emptied the test. A fixed spawn point at the
+route start is rate-limited to a trickle - blocked while a car pulls away from rest, it gave
+2 cars in 45s. And TM lane-changes them by default, so they drifted into OUR lane and queued
+on the ego's bumper, blocking reversing entirely; locking their lane fixes that but must be
+released afterwards, or a car whose lane runs out has nowhere to go and scrapes past.
+
+Three agent bugs routes 2, 5 and 6 could not show:
+
+1. Livelock: no feasible swing-out and a car on the bumper (so no room to reverse), yet the
+   machine entered PREPARING anyway and rediscovered the same infeasibility every 11s, 16
+   times, until the car behind moved. It now waits.
+2. It discarded the room it reversed for - v2.9's standstill release closed the gap back up
+   to FOLLOW_GAP, so the van reversed, crept forward, reversed again. It now holds the gap.
+3. Holding deadlocked in turn: the stall counter accrues only while "held" (close behind the
+   blocker), so holding a gap reset it every tick, the gate never reopened, 362s frozen. It
+   now accrues while holding too.
+
+Three deadlocks this chapter, one signature: a latch whose release condition can only be
+observed by doing what the latch prevents. Worth checking whenever one is added.
+
+| route | scenario           | sim_time_s | collisions | solid_inv | lane_inv | avg km/h | completion |
+|-------|--------------------|-----------|------------|-----------|----------|----------|------------|
+| 7     | blocker + adjacent | 248.0     | 0          | 0         | 17       | 11.5     | 100%       |
+
+Gates now refuse live on three of four branches (beside 52 ticks, behind_gap 43, ahead_gap
+13, one PREPARING abort). TTC stays synthetic-only: it needs a car far enough back to look
+clear while closing too fast, which this stream does not reliably produce.
+
+### v2.11 - de-magic V: the van measures its own braking
+
+MAX_DECEL was an open-loop inverse model - brake = a_req / MAX_DECEL - so a wrong constant
+mis-scaled every brake command and nothing noticed. It is now estimated from the van's own
+behaviour: achieved deceleration divided by the pedal fraction that produced it, filtered
+with a 2s time constant (seconds, not ticks, so it is independent of the fixed delta) and
+updated only while genuinely braking above 1 m/s, since a light pedal or a near standstill
+makes the ratio meaningless.
+
+The evidence is a perturbation test rather than "the stops look fine": starting the estimate
+at 3.0, 6.0 and 9.0 all converged on 7.09 m/s2 with identical route 5 results, so the
+constant is no longer load-bearing. 7.09 is the measured truth, and the old 6.0 made every
+brake ~15% too gentle. MAX_DECEL is now that measured figure rather than a deliberately low
+one - keeping the feedforward wrong to buy margin is hidden conservatism, a magic number
+nobody can audit, and caution belongs in an explicit bias instead.
+
+Braking varies ~15% with speed (6.5 m/s2 at crawl, 7.5 at 8 m/s): one scalar is adequate
+across a town's range and would need binning on faster roads. Weather would move it 3-8x,
+which the estimate follows and a constant cannot.
+
+| route | scenario       | sim_time_s | collisions | solid_inv | lane_inv | avg km/h | completion |
+|-------|----------------|-----------|------------|-----------|----------|----------|------------|
+| 5     | parked blocker | 187.55    | 0          | 0         | 19       | 15.0     | 100%       |
+
+Limits: only graduated braking uses the estimate - emergency cases command brake = 1.0
+directly. The first stop after conditions change still holds the stale figure, which an
+explicit pessimistic bias would cover. And CARLA's weather presets appear not to touch tyre
+friction, so wet braking is untested rather than known-good.
+
+### v2.12 - de-magic VI: route-membership tolerances from the road
+
+Four "is this object on my route" tests used a fixed 2.0 or 3.0 m. They now derive it:
+half the lane width, plus the object's own half-width, plus half the route's point spacing -
+lane width from the waypoint, half-width from the object's box, spacing measured from the
+agent's own route at construction. Route membership is not lane occupancy, which is why it
+cannot be handed to a camera: our path crosses lanes at junctions, and only the planned
+route knows where we intend to go. The two steering lookaheads got the same treatment,
+stated in metres and converted through that spacing rather than counted in waypoints - not
+a derivation, but they no longer change meaning if the route resolution does.
+
+The spacing term is the part I got wrong first. Route points sit ~2 m apart, so something
+exactly on the centreline can still be a metre from the nearest one - the measured distance
+conflates lateral offset with longitudinal sampling. Omitting it tightened the traffic-light
+test to 1.75 m, which lost a stop line: route 7 then finished in 187.5s instead of 247.95s,
+reproducibly, having run five red lights. A 60-second "improvement" that was entirely a
+safety failure, and a reminder to read every metric rather than the headline one.
+
+| route | scenario           | sim_time_s | collisions | solid_inv | lane_inv | red_light | completion |
+|-------|--------------------|-----------|------------|-----------|----------|-----------|------------|
+| 2     | empty              | 187.55    | 0          | 0         | 8        | 0         | 100%       |
+| 5     | parked blocker     | 187.50    | 0          | 0         | 19       | 0         | 100%       |
+| 6     | 20 TM vehicles     | 189.80    | 0          | 0         | 9        | 0         | 100%       |
+| 7     | blocker + adjacent | 247.95    | 0          | 0         | 18       | 0         | 100%       |
+
 ## Assumptions
 
 The agent currently assumes solved perception and localisation, and says so
@@ -396,6 +648,15 @@ own ground truth, independently of what the agent believed).
 ## Notes / future metrics
 - BehaviorAgent overshoots stop lines with long vehicles
 - Straddles lanes when changing before junctions
-- Lane-centring error (distance from lane centreline, per tick)
+- Lane-centring error: implemented - the control trace carries `cross`, `track_err` and
+  `clearance` per tick, summarised by `scripts/track_error.py`
 - Baseline (BehaviorAgent) rows predate the red_light_violations column - re-run pending
+- TTC branch of the lane-entry gates still only synthetically tested: it needs a car far
+  enough back to look clear while closing too fast, which route 7's stream does not
+  reliably produce
 - Violation counter can double-count a light a blind agent re-passes; rankings unaffected
+- Wet / low-friction braking untested - CARLA's weather presets appear not to change tyre
+  friction, so it needs `tire_friction` lowered directly or a friction trigger. A
+  pessimistic bias on the braking estimate would cover the first stop after a change
+- Route 5 lane invasions carry about +/-3 of run-to-run noise (15-19 across identical
+  behaviour), so only differences of 4 or more are meaningful
