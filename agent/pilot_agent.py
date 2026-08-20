@@ -12,8 +12,14 @@ from agents.navigation.local_planner import RoadOption
 from agent.planner import (RefLine, plan as plan_manoeuvre_path, min_blend_length,
                            min_clearance, shape, EXEC_LAG, TAIL)
 
-STEERING_LOOKAHEAD = 2  # waypoints ahead for steering aim
-CURVE_LOOKAHEAD = 4     # route bend measured over target_index .. +4 (~8m)
+STEERING_LOOKAHEAD_M = 4.0  # metres ahead for the steering aim point. NOT a derivation -
+                            # the same distance as the old "2 waypoints", but in metres, so
+                            # it no longer changes meaning when the route planner's 2m
+                            # resolution changes. K and STEER_GAIN were swept against this
+                            # distance, so it is theirs to keep. The real fix is a
+                            # speed-scaled lookahead (4m is only 0.5s of travel at 8 m/s),
+                            # which belongs with the controller work, not here.
+CURVE_LOOKAHEAD_M = 8.0     # metres over which the route's bend is measured, same reasoning
 K = 0.15  # cross-track gain
 STEER_GAIN = math.pi / 6
 MAX_DECEL = 7.09    # measured full-brake deceleration, this van on dry tarmac (route 5,
@@ -615,7 +621,8 @@ class PilotAgent:
         f = self.vehicle.get_transform().get_forward_vector()
         heading = math.atan2(f.y, f.x)
 
-        aim_index = min(self.target_index + STEERING_LOOKAHEAD, len(self.route) - 1)
+        aim_index = min(self.target_index + self._steps_for(STEERING_LOOKAHEAD_M),
+                        len(self.route) - 1)
         wp_aim = self.route[aim_index][0].transform
         A_aim = wp_aim.get_forward_vector()
         aim_offset = self._offset_ahead(loc.distance(wp_aim.location))
@@ -755,8 +762,9 @@ class PilotAgent:
         """How much the road bends ahead (radians): direction of the next
         route segment vs the one after it. Van-independent."""
         i = self.target_index
-        j = min(i + CURVE_LOOKAHEAD // 2, len(self.route) - 1)
-        k = min(i + CURVE_LOOKAHEAD, len(self.route) - 1)
+        span = self._steps_for(CURVE_LOOKAHEAD_M)
+        j = min(i + max(1, span // 2), len(self.route) - 1)
+        k = min(i + span, len(self.route) - 1)
         if i == j or j == k:
             return 0.0  # route too short ahead to measure
         p1 = self.route[i][0].transform.location
@@ -766,6 +774,12 @@ class PilotAgent:
         dir2 = math.atan2(p3.y - p2.y, p3.x - p2.x)
         # same wrap as heading error: bend is the short-way angle difference
         return abs((dir2 - dir1 + math.pi) % (2 * math.pi) - math.pi)
+
+    def _steps_for(self, metres):
+        """How many route waypoints span `metres`, using our route's own spacing. Lets the
+        lookaheads be stated as distances instead of index counts, so they keep their
+        meaning if the route planner's resolution changes."""
+        return max(1, round(metres / max(self._route_step, 0.1)))
 
     def _on_path(self, x, y, waypoints, half_width=0.0):
         """Is (x, y) - optionally an object of that half-width - on the path described by

@@ -601,7 +601,9 @@ half the lane width, plus the object's own half-width, plus half the route's poi
 lane width from the waypoint, half-width from the object's box, spacing measured from the
 agent's own route at construction. Route membership is not lane occupancy, which is why it
 cannot be handed to a camera: our path crosses lanes at junctions, and only the planned
-route knows where we intend to go.
+route knows where we intend to go. The two steering lookaheads got the same treatment,
+stated in metres and converted through that spacing rather than counted in waypoints - not
+a derivation, but they no longer change meaning if the route resolution does.
 
 The spacing term is the part I got wrong first. Route points sit ~2 m apart, so something
 exactly on the centreline can still be a metre from the nearest one - the measured distance
