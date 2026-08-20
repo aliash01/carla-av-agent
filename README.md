@@ -2,7 +2,7 @@
 A staged autonomous driving agent and evaluation benchmark for CARLA 0.10 (UE5).
 
 ## Status
-Working: benchmark + baseline + PilotAgent v2.11 - lane discipline, traffic lights, closing-speed following, live traffic, speed-limit control, unsticking past blockers with a planner-certified manoeuvre tested against traffic in the target lane, and braking scaled by a figure the van measures on itself. Next: camera perception, or feedforward steering.
+Working: benchmark + baseline + PilotAgent v2.12 - lane discipline, traffic lights, closing-speed following, live traffic, speed-limit control, unsticking past blockers with a planner-certified manoeuvre tested against traffic in the target lane, and braking scaled by a figure the van measures on itself. Next: camera perception, or feedforward steering.
 
 ## Setup
 1. CARLA 0.10 (UE5) built from source; start the server:
@@ -593,6 +593,29 @@ Limits: only graduated braking uses the estimate - emergency cases command brake
 directly. The first stop after conditions change still holds the stale figure, which an
 explicit pessimistic bias would cover. And CARLA's weather presets appear not to touch tyre
 friction, so wet braking is untested rather than known-good.
+
+### v2.12 - de-magic VI: route-membership tolerances from the road
+
+Four "is this object on my route" tests used a fixed 2.0 or 3.0 m. They now derive it:
+half the lane width, plus the object's own half-width, plus half the route's point spacing -
+lane width from the waypoint, half-width from the object's box, spacing measured from the
+agent's own route at construction. Route membership is not lane occupancy, which is why it
+cannot be handed to a camera: our path crosses lanes at junctions, and only the planned
+route knows where we intend to go.
+
+The spacing term is the part I got wrong first. Route points sit ~2 m apart, so something
+exactly on the centreline can still be a metre from the nearest one - the measured distance
+conflates lateral offset with longitudinal sampling. Omitting it tightened the traffic-light
+test to 1.75 m, which lost a stop line: route 7 then finished in 187.5s instead of 247.95s,
+reproducibly, having run five red lights. A 60-second "improvement" that was entirely a
+safety failure, and a reminder to read every metric rather than the headline one.
+
+| route | scenario           | sim_time_s | collisions | solid_inv | lane_inv | red_light | completion |
+|-------|--------------------|-----------|------------|-----------|----------|-----------|------------|
+| 2     | empty              | 187.55    | 0          | 0         | 8        | 0         | 100%       |
+| 5     | parked blocker     | 187.50    | 0          | 0         | 19       | 0         | 100%       |
+| 6     | 20 TM vehicles     | 189.80    | 0          | 0         | 9        | 0         | 100%       |
+| 7     | blocker + adjacent | 247.95    | 0          | 0         | 18       | 0         | 100%       |
 
 ## Assumptions
 

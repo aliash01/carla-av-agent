@@ -75,6 +75,10 @@ class PilotAgent:
                        for wp in l.get_stop_waypoints()]
         self.half_length = vehicle.bounding_box.extent.x   # centre-to-bumper, for gap maths
         self.half_width = vehicle.bounding_box.extent.y    # centre-to-side, for the planner footprint
+        # how far apart our own route points are, for route-membership tolerances
+        self._route_step = (sum(p[0].transform.location.distance(q[0].transform.location)
+                                for p, q in zip(self.route, self.route[1:]))
+                            / max(1, len(self.route) - 1)) if len(self.route) > 1 else 2.0
         self._last_obs = None   # previous tick's obstacle distance, for "gap opening?" checks
         self._stopping_for_light = False    # latched once a stop is committed; cleared on green
         self._closing_on_obstacle = False   # latched while regulating the follow gap; cleared when restored
@@ -511,14 +515,13 @@ class PilotAgent:
         keeps a car on a crossing road from being mistaken for our blocker."""
         loc = obs["loc"]
         f = self.vehicle.get_transform().get_forward_vector()
-        upcoming = [p[0].transform.location
-                    for p in self.route[self.target_index:self.target_index + 15]]
+        upcoming = [p[0] for p in self.route[self.target_index:self.target_index + 15]]
         best, best_along = None, None
         for v in obs["vehicles"]:
             along = f.x * (v["x"] - loc.x) + f.y * (v["y"] - loc.y)
             if along <= 0.0:
                 continue                            # behind us
-            if not any(math.hypot(v["x"] - p.x, v["y"] - p.y) < 3.0 for p in upcoming):
+            if not self._on_path(v["x"], v["y"], upcoming, v["half_width"]):
                 continue                            # not on our route
             if best_along is None or along < best_along:
                 best, best_along = v, along
@@ -733,8 +736,7 @@ class PilotAgent:
 
     def _queue_beyond(self, loc, obs_dist):
         """Another stationary vehicle on our route beyond the immediate blocker."""
-        upcoming = [p[0].transform.location
-                    for p in self.route[self.target_index:self.target_index + 25]]
+        upcoming = [p[0] for p in self.route[self.target_index:self.target_index + 25]]
         for actor in self.vehicle.get_world().get_actors().filter('vehicle.*'):
             if actor.id == self.vehicle.id:
                 continue
@@ -742,7 +744,8 @@ class PilotAgent:
             d = other_loc.distance(loc)
             if d <= obs_dist + self.half_length + actor.bounding_box.extent.x + 2.0 or d > 45.0:
                 continue
-            if not any(other_loc.distance(p) < 2.0 for p in upcoming):
+            if not self._on_path(other_loc.x, other_loc.y, upcoming,
+                                 actor.bounding_box.extent.y):
                 continue
             if actor.get_velocity().length() < 0.5:
                 return True
@@ -764,6 +767,28 @@ class PilotAgent:
         # same wrap as heading error: bend is the short-way angle difference
         return abs((dir2 - dir1 + math.pi) % (2 * math.pi) - math.pi)
 
+    def _on_path(self, x, y, waypoints, half_width=0.0):
+        """Is (x, y) - optionally an object of that half-width - on the path described by
+        `waypoints`? An object counts when any part of it lies in the lane we intend to
+        occupy, so the tolerance is half THAT lane, plus the object's own half-width, plus
+        half the route's own point spacing - all read from the road, the object and the
+        route rather than the fixed 2 and 3 metres this replaced.
+
+        The spacing term matters: route points are ~2m apart, so something exactly on the
+        centreline can still be a metre from the nearest one. Omitting it tightened the
+        traffic-light test from 3.0m to 1.75m, which lost a stop line - route 7 then sailed
+        through and finished 60s "faster" with 5 red-light violations.
+
+        Route membership, not lane occupancy: our path crosses lanes at junctions, so it
+        cannot be derived from lane markings alone - only the planned route knows where we
+        intend to go."""
+        for wp in waypoints:
+            wl = wp.transform.location
+            if (math.hypot(x - wl.x, y - wl.y)
+                    <= wp.lane_width * 0.5 + half_width + self._route_step * 0.5):
+                return True
+        return False
+
     def _perceive_traffic_light(self):
         """Ground-truth light perception (CARLA state query + map geometry).
         Returns distance to the stop line if a red light governing OUR ROUTE
@@ -771,7 +796,7 @@ class PilotAgent:
         query is replaced by camera-based detection."""
         loc = self.vehicle.get_location()
         # our upcoming path: next ~15 route points (~30m)
-        upcoming = [p[0].transform.location for p in self.route[max(0, self.target_index - 2):self.target_index + 15]]
+        upcoming = [p[0] for p in self.route[max(0, self.target_index - 2):self.target_index + 15]]
         best = None
         for light, stop_loc in self.lights:
             d = stop_loc.distance(loc)
@@ -781,7 +806,7 @@ class PilotAgent:
                 continue
             # route membership: the stop line must sit on OUR upcoming path,
             # not a crossing road's (kills phantom mid-junction stops)
-            if not any(stop_loc.distance(p) < 3.0 for p in upcoming):
+            if not self._on_path(stop_loc.x, stop_loc.y, upcoming):
                 continue
             if best is None or d < best:
                 best = d
@@ -794,8 +819,7 @@ class PilotAgent:
         means the gap is shrinking - same convention as _perceive_lane.
         Radar's native measurement pair; contract stays fixed when replaced."""
         loc = self.vehicle.get_location()
-        upcoming = [p[0].transform.location
-                    for p in self.route[self.target_index:self.target_index + 15]]
+        upcoming = [p[0] for p in self.route[self.target_index:self.target_index + 15]]
         f = self.vehicle.get_transform().get_forward_vector()
         my_v = self.vehicle.get_velocity()
         my_along = my_v.x * f.x + my_v.y * f.y
@@ -808,7 +832,8 @@ class PilotAgent:
             if d > 30.0:
                 continue
             # route membership: it blocks OUR path, not a neighbouring lane's
-            if not any(other_loc.distance(p) < 2.0 for p in upcoming):
+            if not self._on_path(other_loc.x, other_loc.y, upcoming,
+                                 actor.bounding_box.extent.y):
                 continue
             # centre-to-centre -> bumper-to-bumper: subtract both half-lengths
             d = max(0.0, d - self.half_length - actor.bounding_box.extent.x)
@@ -858,21 +883,21 @@ class PilotAgent:
             return None
 
         # the lane as a stretch: ~20m ahead and ~20m behind our position
-        chain = [candidate.transform.location]
+        chain = [candidate]
         w = candidate
         for _ in range(10):
             nxt = w.next(2.0)
             if not nxt:
                 break
             w = nxt[0]
-            chain.append(w.transform.location)
+            chain.append(w)
         w = candidate
         for _ in range(10):
             prv = w.previous(2.0)
             if not prv:
                 break
             w = prv[0]
-            chain.append(w.transform.location)
+            chain.append(w)
 
         f = self.vehicle.get_transform().get_forward_vector()
         my_v = self.vehicle.get_velocity()
@@ -886,7 +911,8 @@ class PilotAgent:
             other_loc = actor.get_location()
             if other_loc.distance(loc) > 40.0:
                 continue
-            if not any(other_loc.distance(p) < 2.0 for p in chain):
+            if not self._on_path(other_loc.x, other_loc.y, chain,
+                                 actor.bounding_box.extent.y):
                 continue                               # not in that lane
 
             other_half = actor.bounding_box.extent.x
@@ -935,7 +961,7 @@ class PilotAgent:
             if not prv:
                 break
             w = prv[0]
-            chain.append(w.transform.location)
+            chain.append(w)
         if not chain:
             return None
         f = self.vehicle.get_transform().get_forward_vector()
@@ -946,7 +972,8 @@ class PilotAgent:
             other_loc = actor.get_location()
             if other_loc.distance(loc) > 30.0:
                 continue
-            if not any(other_loc.distance(p) < 2.0 for p in chain):
+            if not self._on_path(other_loc.x, other_loc.y, chain,
+                                 actor.bounding_box.extent.y):
                 continue
             along = f.x * (other_loc.x - loc.x) + f.y * (other_loc.y - loc.y)
             if along >= 0:
