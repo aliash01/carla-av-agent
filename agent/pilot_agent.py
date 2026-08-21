@@ -222,9 +222,13 @@ class PilotAgent:
         pass per tick, and every decision sees the same world."""
         loc = self.vehicle.get_location()
         obstacle = self._perceive_obstacle()
+        # geometry picks the light, perception reads its colour - see _governing_light
+        governing = self._governing_light()
         return {"loc": loc,
                 "speed": self.vehicle.get_velocity().length(),
-                "light": self._perceive_traffic_light(),
+                "light_dist": None if governing is None else governing[1],
+                "light_state": ('not_red' if governing is None
+                                else self._perceive_light_state(governing[0])),
                 "obstacle": obstacle[0] if obstacle is not None else None,
                 "obstacle_closing": obstacle[1] if obstacle is not None else None,
                 "lane_left": self._perceive_lane('left', loc),
@@ -270,7 +274,9 @@ class PilotAgent:
         # fixed 20m gate (which encoded ~1.6 m/s2 at town speed and nothing else).
         # Once stopped, hold until the light stops reporting red: a_req is 0 at
         # standstill, so physics alone would release the hold and run the light.
-        red_dist = obs["light"]
+        # 'red' is the only state that brakes us; 'unknown' will need the asymmetric
+        # rule (hold a red, never hold a green) once a camera can return it
+        red_dist = obs["light_dist"] if obs["light_state"] == 'red' else None
         if red_dist is None:
             self._stopping_for_light = False      # green or behind us: commitment ends
         else:
@@ -721,7 +727,7 @@ class PilotAgent:
         if self._blocked_ticks < STALL_TICK_LIMIT:
             self._gate_reason = 'waiting'
             return None
-        red = obs["light"]
+        red = obs["light_dist"] if obs["light_state"] == 'red' else None
         if red is not None and red <= 25.0:
             self._gate_reason = 'light'
             return None
@@ -803,28 +809,42 @@ class PilotAgent:
                 return True
         return False
 
-    def _perceive_traffic_light(self):
-        """Ground-truth light perception (CARLA state query + map geometry).
-        Returns distance to the stop line if a red light governing OUR ROUTE
-        lies within 25m ahead, else None. Contract stays fixed when the state
-        query is replaced by camera-based detection."""
+    def _governing_light(self):
+        """MAP geometry, not perception: which traffic light governs us, and how far its
+        stop line is. Returns (light, distance) or None.
+
+        Split out from the old _perceive_traffic_light, which conflated two jobs - it
+        searched for the nearest RED line, so geometry and colour were decided together.
+        Keeping them apart is what lets a camera replace only the colour question, which
+        is the only part a camera can answer: which head applies to us, and where to stop,
+        come from the map in production stacks too.
+
+        Note this now picks the NEAREST light on our route regardless of colour, where the
+        old code picked the nearest red one. That is the more correct reading - the nearer
+        light is the one governing us - but it is a behaviour change when two are in range."""
         loc = self.vehicle.get_location()
-        # our upcoming path: next ~15 route points (~30m)
         upcoming = [p[0] for p in self.route[max(0, self.target_index - 2):self.target_index + 15]]
         best = None
         for light, stop_loc in self.lights:
             d = stop_loc.distance(loc)
             if d > 25.0:
                 continue
-            if light.get_state() != carla.TrafficLightState.Red:
-                continue
             # route membership: the stop line must sit on OUR upcoming path,
             # not a crossing road's (kills phantom mid-junction stops)
             if not self._on_path(stop_loc.x, stop_loc.y, upcoming):
                 continue
-            if best is None or d < best:
-                best = d
+            if best is None or d < best[1]:
+                best = (light, d)
         return best
+
+    def _perceive_light_state(self, light):
+        """Ground-truth light perception (CARLA state query). Returns 'red', 'not_red' or
+        'unknown' - the ONLY part a camera replaces, and the reason the third value exists:
+        a camera can fail to see, where a ground-truth query cannot. 'unknown' is never
+        returned here, so behaviour is unchanged until the camera lands.
+
+        Real-world analogue: colour from the camera, everything else from the map."""
+        return 'red' if light.get_state() == carla.TrafficLightState.Red else 'not_red'
 
     def _perceive_obstacle(self):
         """Ground-truth obstacle perception (CARLA actor query). Returns
